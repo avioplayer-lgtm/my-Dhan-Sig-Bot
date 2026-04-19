@@ -26,8 +26,8 @@ MIN_CONFIDENCE = 6
 IST            = pytz.timezone("Asia/Kolkata")
 
 SYMBOLS = {
-    "NIFTY":     {"yahoo": "^NSEI",    "interval": 50,  "lot": 75,  "expiry_day": 3, "dhan_scrip": 13},
-    "BANKNIFTY": {"yahoo": "^NSEBANK", "interval": 100, "lot": 35,  "expiry_day": 3, "dhan_scrip": 25},
+    "NIFTY":     {"yahoo": "^NSEI",    "interval": 50,  "lot": 65,  "expiry_day": 3, "dhan_scrip": 13},
+    "BANKNIFTY": {"yahoo": "^NSEBANK", "interval": 100, "lot": 30,  "expiry_day": 3, "dhan_scrip": 25},
 }
 
 STRATEGY_RANK = {"TRENDING": 3, "VOLATILE": 2, "SIDEWAYS": 1}
@@ -59,7 +59,6 @@ def set_st(key, val):
     with _lock:
         state[key] = val
 
-# DHAN LIVE OPTION CHAIN
 _expiry_cache = {}
 
 def get_next_expiry(scrip_id):
@@ -114,28 +113,34 @@ def get_live_premium(name, spot, strike, opt_type):
             },
             timeout=10,
         )
-        oc  = resp.json().get("data", {}).get("oc", {})
+        data = resp.json()
+        log.info(f"{name} Dhan response status: {data.get('status')} keys: {list(data.get('data', {}).keys())[:5]}")
+        oc  = data.get("data", {}).get("oc", {})
         key = opt_type.lower()
         best_strike_key = None
         best_diff = float("inf")
         for sk in oc:
             try:
-                diff = abs(float(sk) - strike)
+                diff = abs(float(sk) - float(strike))
                 if diff < best_diff:
                     best_diff = diff
                     best_strike_key = sk
             except ValueError:
                 pass
-        if best_strike_key and key in oc[best_strike_key]:
-            ltp = oc[best_strike_key][key].get("last_price")
-            if ltp and ltp > 0:
-                log.info(f"{name} live LTP {strike} {opt_type}: Rs.{ltp}")
+        if best_strike_key:
+            option_data = oc[best_strike_key].get(key, {})
+            ltp = option_data.get("last_price")
+            if ltp and float(ltp) > 0:
+                log.info(f"{name} LIVE LTP {strike} {opt_type}: Rs.{ltp}")
                 return round(float(ltp))
+            else:
+                log.warning(f"{name}: LTP is 0 or missing for {strike} {opt_type} - using estimate")
+        else:
+            log.warning(f"{name}: No matching strike found in option chain")
     except Exception as e:
         log.error(f"get_live_premium error: {e}")
     return estimate_premium(spot, strike, opt_type, days_to_expiry(name))
 
-# TELEGRAM HELPERS
 def _tg(endpoint, payload):
     try:
         r = requests.post(
@@ -176,7 +181,6 @@ def edit_message(message_id, text, keep_buttons=False):
 def answer_callback(callback_id, text=""):
     _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": False})
 
-# CALLBACK HANDLER
 def handle_callback(query):
     cb_id      = query["id"]
     data       = query.get("data", "")
@@ -206,14 +210,15 @@ def handle_callback(query):
             del state["pending_signals"][signal_id]
         answer_callback(cb_id, "Trade logged!")
         s = signal
+        cost_per_lot = s["atm_prem"] * s["lot"]
         edit_message(message_id,
             f"*Trade Taken*\n\n"
             f"*{s['symbol']}* {s['atm_strike']} {s['direction']}\n"
             f"Regime: {s['regime']}\nStrategy: {s['strategy']}\n\n"
             f"Entry (live LTP) : Rs.{s['atm_prem']} per unit\n"
+            f"Cost of 1 lot    : Rs.{cost_per_lot:,} ({s['lot']} units)\n"
             f"Stop Loss        : Rs.{s['sl_prem']}\n"
-            f"Target           : Rs.{s['tgt_prem']}\n"
-            f"Lot size         : {s['lot']} units\n\n"
+            f"Target           : Rs.{s['tgt_prem']}\n\n"
             f"Bot will notify when SL or Target is hit.")
         log.info(f"Trade taken: {s['symbol']} {s['atm_strike']} {s['direction']}")
     elif action == "skip":
@@ -234,7 +239,6 @@ def handle_callback(query):
     else:
         answer_callback(cb_id, "Unknown action")
 
-# POLLING THREAD
 def telegram_polling_thread():
     log.info("Telegram polling thread started")
     offset = 0
@@ -258,7 +262,6 @@ def telegram_polling_thread():
             log.error(f"Polling thread error: {e}")
             time.sleep(5)
 
-# INDICATORS
 def compute_indicators(df):
     df = df.copy()
     df["ema9"]  = df["Close"].ewm(span=9,  adjust=False).mean()
@@ -273,7 +276,6 @@ def compute_indicators(df):
     df["vwap"]  = cum_pv / cum_vol.replace(0, 1e-9)
     return df
 
-# REGIME DETECTION
 def detect_regime(df, atr, ema9, ema21):
     recent   = df.iloc[-10:]
     rng      = recent["High"].max() - recent["Low"].min()
@@ -295,7 +297,6 @@ def confirm_regime(symbol, new_regime):
         rs["count"] = 1
     return new_regime if rs["count"] >= 2 else None
 
-# STRATEGIES
 def strategy_breakout(df, atr, ema9, ema21, rsi, vwap):
     orb_high = float(df.iloc[:3]["High"].max())
     orb_low  = float(df.iloc[:3]["Low"].min())
@@ -354,7 +355,6 @@ def strategy_momentum(df, atr, rsi):
         return "CE", close, close - atr * 1.3, close + atr * 2.5, conf
     return "PE", close, close + atr * 1.3, close - atr * 2.5, conf
 
-# EXPIRY HELPERS
 def days_to_expiry(name):
     cfg     = SYMBOLS.get(name, {})
     exp_day = cfg.get("expiry_day")
@@ -367,14 +367,12 @@ def is_expiry_today(name):
     exp_day = cfg.get("expiry_day")
     return datetime.now(IST).weekday() == exp_day
 
-# FALLBACK PREMIUM ESTIMATOR
 def estimate_premium(spot, strike, opt_type, dte):
     iv        = 0.14
     intrinsic = max(0, spot - strike) if opt_type == "CE" else max(0, strike - spot)
     time_val  = round(spot * iv * max(dte, 1) / 365)
     return max(10, round(intrinsic + time_val))
 
-# SIGNAL SCANNER
 def scan_symbol(name):
     cfg      = SYMBOLS[name]
     interval = cfg["interval"]
@@ -429,6 +427,7 @@ def scan_symbol(name):
             tgt_prem = round(atm_prem * 1.90)
         risk_per_lot = max(1, (atm_prem - sl_prem) * lot)
         sugg_lots    = max(1, int((CAPITAL * RISK_PCT) / risk_per_lot))
+        cost_per_lot = atm_prem * lot
         return {
             "id":           str(uuid.uuid4())[:8],
             "symbol":       name,
@@ -444,6 +443,7 @@ def scan_symbol(name):
             "sl_prem":      sl_prem,
             "tgt_prem":     tgt_prem,
             "sugg_lots":    sugg_lots,
+            "cost_per_lot": cost_per_lot,
             "lot":          lot,
             "sl_idx":       round(sl_idx, 2),
             "tgt_idx":      round(tgt_idx, 2),
@@ -460,7 +460,6 @@ def scan_symbol(name):
         log.error(f"{name}: scan_symbol error - {e}")
         return None
 
-# SL / TARGET MONITORING
 def check_sl_target():
     trade = get_st("active_trade")
     if not trade:
@@ -486,18 +485,15 @@ def check_sl_target():
             with _lock:
                 state["daily_loss"] += CAPITAL * RISK_PCT
                 state["active_trade"] = None
-            log.info(f"SL hit: {sym} {trade['atm_strike']} {dire}")
         elif tgt_hit:
             send_text(
                 f"TARGET HIT\n\n{sym} {trade['atm_strike']} {dire}\n"
                 f"Index now: {live:,.2f}\nTgt level: {tgt:,.2f}\n\nBOOK PROFIT NOW.")
             with _lock:
                 state["active_trade"] = None
-            log.info(f"Target hit: {sym} {trade['atm_strike']} {dire}")
     except Exception as e:
         log.error(f"check_sl_target error: {e}")
 
-# MESSAGE BUILDERS
 def build_signal_msg(s):
     exp_line = ("EXPIRY DAY - SL tightened. Exit before 2:45 PM."
                 if s["expiry_today"] else f"{s['dte']} day(s) to expiry")
@@ -520,10 +516,10 @@ def build_signal_msg(s):
         f"WHAT TO BUY\n"
         f"ATM {s['atm_strike']} {s['direction']} : Rs.{s['atm_prem']} {live_tag}\n"
         f"OTM {s['otm_strike']} {s['direction']} : Rs.{s['otm_prem']} {live_tag} (cheaper)\n\n"
-        f"Stop Loss  : Rs.{s['sl_prem']}\n"
-        f"Target     : Rs.{s['tgt_prem']}\n"
-        f"Lot size   : {s['lot']} units\n"
-        f"Suggested  : {s['sugg_lots']} lot(s) Rs.{int(CAPITAL * RISK_PCT)} risk\n\n"
+        f"Cost of 1 lot  : Rs.{s['cost_per_lot']:,} ({s['lot']} units x Rs.{s['atm_prem']})\n"
+        f"Stop Loss      : Rs.{s['sl_prem']}\n"
+        f"Target         : Rs.{s['tgt_prem']}\n"
+        f"Suggested      : {s['sugg_lots']} lot(s) Rs.{int(CAPITAL * RISK_PCT)} risk\n\n"
         f"{exp_line}{block}\n\n"
         f"Tap a button below"
     )
@@ -654,13 +650,11 @@ def main():
                         msg_id = send_with_buttons(build_signal_msg(sig), sig["id"])
                         with _lock:
                             state["pending_signals"][sig["id"]] = {**sig, "msg_id": msg_id}
-                        log.info(f"Signal: {sig['symbol']} {sig['direction']} {sig['atm_strike']} [{sig['regime']}]")
                 else:
                     log.info("No confirmed signals this scan")
             except Exception as e:
                 log.error(f"Main scan error: {e}")
         wait_next_5min()
-
 
 if __name__ == "__main__":
     main()
