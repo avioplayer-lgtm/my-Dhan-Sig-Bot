@@ -13,8 +13,11 @@ from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID   = os.environ.get("CHAT_ID")
+# ─────────────────────────────────────────
+# ENV CONFIG
+# ─────────────────────────────────────────
+BOT_TOKEN         = os.environ.get("BOT_TOKEN")
+CHAT_ID           = os.environ.get("CHAT_ID")
 DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID")
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
 
@@ -28,12 +31,15 @@ MIN_CONFIDENCE = 6
 IST            = pytz.timezone("Asia/Kolkata")
 
 SYMBOLS = {
-    "NIFTY":     {"yahoo": "^NSEI",    "interval": 50,  "lot": 65,  "expiry_day": 3, "dhan_scrip": 13},
-    "BANKNIFTY": {"yahoo": "^NSEBANK", "interval": 100, "lot": 30,  "expiry_day": 3, "dhan_scrip": 25},
+    "NIFTY":     {"yahoo": "^NSEI",    "interval": 50,  "lot": 65, "expiry_day": 3, "dhan_scrip": 13},
+    "BANKNIFTY": {"yahoo": "^NSEBANK", "interval": 100, "lot": 30, "expiry_day": 3, "dhan_scrip": 25},
 }
 
 STRATEGY_RANK = {"TRENDING": 3, "VOLATILE": 2, "SIDEWAYS": 1}
 
+# ─────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -41,8 +47,17 @@ logging.basicConfig(
 )
 log = logging.getLogger("DhanSignalBot")
 
+# ─────────────────────────────────────────
+# SQLITE PERSISTENCE
+# ─────────────────────────────────────────
+conn = sqlite3.connect("state.db", check_same_thread=False)
+conn.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
+conn.commit()
+log.info("SQLite state.db initialised")
+
 _lock = threading.Lock()
 regime_state = {name: {"last": None, "count": 0} for name in SYMBOLS}
+
 state = {
     "active_trade":        None,
     "pending_signals":     {},
@@ -60,7 +75,7 @@ def get_st(key):
 def set_st(key, val):
     with _lock:
         state[key] = val
-        _save_locked()
+    _persist_state()
 
 def _jsonable(v):
     if isinstance(v, (str, int, float, bool)) or v is None:
@@ -74,26 +89,34 @@ def _jsonable(v):
     return str(v)
 
 def _persist_state():
-    payload = _jsonable(state)
-    with conn:
-        conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", ("state", json.dumps(payload)))
+    try:
+        payload = _jsonable(state)
+        with conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)",
+                ("state", json.dumps(payload))
+            )
+    except Exception as e:
+        log.error(f"_persist_state error: {e}")
 
 def _load_state():
-    row = conn.execute("SELECT v FROM kv WHERE k='state'").fetchone()
-    if not row:
-        return
     try:
+        row = conn.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+        if not row:
+            log.info("No saved state found - starting fresh")
+            return
         saved = json.loads(row[0])
         with _lock:
             for k, v in saved.items():
                 if k in state:
                     state[k] = v
+        log.info("State restored from SQLite")
     except Exception as e:
-        log.error(f"state load error: {e}")
+        log.error(f"_load_state error: {e}")
 
-def _save_locked():
-    _persist_state()
-
+# ─────────────────────────────────────────
+# DHAN LIVE OPTION CHAIN
+# ─────────────────────────────────────────
 _expiry_cache = {}
 
 def get_next_expiry(scrip_id):
@@ -113,6 +136,7 @@ def get_next_expiry(scrip_id):
             json={"UnderlyingScrip": scrip_id, "UnderlyingSeg": "IDX_I"},
             timeout=10,
         )
+        resp.raise_for_status()
         expiries = resp.json().get("data", [])
         today_date = datetime.now(IST).date()
         for exp in sorted(expiries):
@@ -128,11 +152,12 @@ def get_live_premium(name, spot, strike, opt_type):
     cfg      = SYMBOLS[name]
     scrip_id = cfg["dhan_scrip"]
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
-        return estimate_premium(spot, strike, opt_type, days_to_expiry(name))
+        log.info(f"{name}: No Dhan credentials - using estimate")
+        return estimate_premium(spot, strike, opt_type, days_to_expiry(name)), False
     expiry = get_next_expiry(scrip_id)
     if not expiry:
-        log.warning(f"{name}: Could not get expiry, using estimate")
-        return estimate_premium(spot, strike, opt_type, days_to_expiry(name))
+        log.warning(f"{name}: Could not get expiry - using estimate")
+        return estimate_premium(spot, strike, opt_type, days_to_expiry(name)), False
     try:
         resp = requests.post(
             "https://api.dhan.co/v2/optionchain",
@@ -149,9 +174,8 @@ def get_live_premium(name, spot, strike, opt_type):
             timeout=10,
         )
         resp.raise_for_status()
-        resp.raise_for_status()
         data = resp.json()
-        log.info(f"{name} Dhan response status: {data.get('status')} keys: {list(data.get('data', {}).keys())[:5]}")
+        log.info(f"{name} Dhan status: {data.get('status')} | keys: {list(data.get('data', {}).keys())[:5]}")
         oc  = data.get("data", {}).get("oc", {})
         key = opt_type.lower()
         best_strike_key = None
@@ -169,15 +193,18 @@ def get_live_premium(name, spot, strike, opt_type):
             ltp = option_data.get("last_price")
             if ltp and float(ltp) > 0:
                 log.info(f"{name} LIVE LTP {strike} {opt_type}: Rs.{ltp}")
-                return round(float(ltp))
+                return round(float(ltp)), True   # True = is_live
             else:
-                log.warning(f"{name}: LTP is 0 or missing for {strike} {opt_type} - using estimate")
+                log.warning(f"{name}: LTP=0 for {strike} {opt_type} - using estimate")
         else:
-            log.warning(f"{name}: No matching strike found in option chain")
+            log.warning(f"{name}: No matching strike in option chain")
     except Exception as e:
         log.error(f"get_live_premium error: {e}")
-    return estimate_premium(spot, strike, opt_type, days_to_expiry(name))
+    return estimate_premium(spot, strike, opt_type, days_to_expiry(name)), False
 
+# ─────────────────────────────────────────
+# TELEGRAM HELPERS
+# ─────────────────────────────────────────
 def _tg(endpoint, payload):
     try:
         r = requests.post(
@@ -204,13 +231,20 @@ def send_with_buttons(text, signal_id):
         ]
     }
     res = _tg("sendMessage", {
-        "chat_id": CHAT_ID, "text": text,
-        "parse_mode": "Markdown", "reply_markup": keyboard,
+        "chat_id":      CHAT_ID,
+        "text":         text,
+        "parse_mode":   "Markdown",
+        "reply_markup": keyboard,
     })
     return res.get("result", {}).get("message_id")
 
 def edit_message(message_id, text, keep_buttons=False):
-    payload = {"chat_id": CHAT_ID, "message_id": message_id, "text": text, "parse_mode": "Markdown"}
+    payload = {
+        "chat_id":    CHAT_ID,
+        "message_id": message_id,
+        "text":       text,
+        "parse_mode": "Markdown",
+    }
     if not keep_buttons:
         payload["reply_markup"] = {"inline_keyboard": []}
     _tg("editMessageText", payload)
@@ -218,6 +252,9 @@ def edit_message(message_id, text, keep_buttons=False):
 def answer_callback(callback_id, text=""):
     _tg("answerCallbackQuery", {"callback_query_id": callback_id, "text": text, "show_alert": False})
 
+# ─────────────────────────────────────────
+# CALLBACK HANDLER
+# ─────────────────────────────────────────
 def handle_callback(query):
     cb_id      = query["id"]
     data       = query.get("data", "")
@@ -239,35 +276,37 @@ def handle_callback(query):
                 ex = state["active_trade"]
                 answer_callback(cb_id, "Trade already open!")
                 edit_message(message_id,
-                    f"Blocked - already have open trade:\n"
+                    f"Blocked - active trade exists:\n"
                     f"{ex['symbol']} {ex['atm_strike']} {ex['direction']}\n"
                     f"Close that first.")
                 return
             state["active_trade"] = signal
             state["pending_signals"].pop(signal_id, None)
-            _save_locked()
+        _persist_state()
         answer_callback(cb_id, "Trade logged!")
-        s = signal
+        s            = signal
         cost_per_lot = s["atm_prem"] * s["lot"]
+        live_tag     = "(live)" if s.get("prem_is_live") else "(est.)"
         edit_message(message_id,
             f"*Trade Taken*\n\n"
             f"*{s['symbol']}* {s['atm_strike']} {s['direction']}\n"
-            f"Regime: {s['regime']}\nStrategy: {s['strategy']}\n\n"
-            f"Entry (live LTP) : Rs.{s['atm_prem']} per unit\n"
+            f"Regime: {s['regime']}  |  Strategy: {s['strategy']}\n\n"
+            f"Entry {live_tag}      : Rs.{s['atm_prem']} per unit\n"
             f"Cost of 1 lot    : Rs.{cost_per_lot:,} ({s['lot']} units)\n"
             f"Stop Loss        : Rs.{s['sl_prem']}\n"
             f"Target           : Rs.{s['tgt_prem']}\n\n"
-            f"Bot will monitor option premium for SL/Target.")
+            f"Bot will alert when SL or Target is hit.")
         log.info(f"Trade taken: {s['symbol']} {s['atm_strike']} {s['direction']}")
     elif action == "skip":
         with _lock:
             pending.pop(signal_id, None)
+        _persist_state()
         answer_callback(cb_id, "Skipped")
         s = signal
         edit_message(message_id,
             f"Skipped: {s['symbol']} {s['atm_strike']} {s['direction']}\n"
             f"Watching for next signal...")
-        log.info(f"Signal skipped: {s['symbol']} {s['atm_strike']} {s['direction']}")
+        log.info(f"Skipped: {s['symbol']} {s['atm_strike']} {s['direction']}")
     elif action == "remind":
         answer_callback(cb_id, "Will remind at next scan")
         if message_id:
@@ -277,6 +316,9 @@ def handle_callback(query):
     else:
         answer_callback(cb_id, "Unknown action")
 
+# ─────────────────────────────────────────
+# TELEGRAM POLLING THREAD
+# ─────────────────────────────────────────
 def telegram_polling_thread():
     log.info("Telegram polling thread started")
     offset = 0
@@ -300,12 +342,19 @@ def telegram_polling_thread():
             log.error(f"Polling thread error: {e}")
             time.sleep(5)
 
+# ─────────────────────────────────────────
+# INDICATORS
+# ─────────────────────────────────────────
+def now_ist():
+    return datetime.now(IST)
+
 def is_candle_fresh(df, max_minutes=20):
     try:
         last = df.index[-1]
         if getattr(last, "tzinfo", None) is None:
             last = last.tz_localize(IST) if hasattr(last, "tz_localize") else last
-        return (now_ist() - last.to_pydatetime()).total_seconds() <= max_minutes * 60
+        age = (now_ist() - last.to_pydatetime()).total_seconds()
+        return age <= max_minutes * 60
     except Exception:
         return True
 
@@ -323,6 +372,9 @@ def compute_indicators(df):
     df["vwap"]  = cum_pv / cum_vol.replace(0, 1e-9)
     return df
 
+# ─────────────────────────────────────────
+# REGIME DETECTION
+# ─────────────────────────────────────────
 def detect_regime(df, atr, ema9, ema21):
     recent   = df.iloc[-10:]
     rng      = recent["High"].max() - recent["Low"].min()
@@ -344,6 +396,9 @@ def confirm_regime(symbol, new_regime):
         rs["count"] = 1
     return new_regime if rs["count"] >= 2 else None
 
+# ─────────────────────────────────────────
+# STRATEGIES
+# ─────────────────────────────────────────
 def strategy_breakout(df, atr, ema9, ema21, rsi, vwap):
     orb_high = float(df.iloc[:3]["High"].max())
     orb_low  = float(df.iloc[:3]["Low"].min())
@@ -402,6 +457,9 @@ def strategy_momentum(df, atr, rsi):
         return "CE", close, close - atr * 1.3, close + atr * 2.5, conf
     return "PE", close, close + atr * 1.3, close - atr * 2.5, conf
 
+# ─────────────────────────────────────────
+# EXPIRY & PREMIUM HELPERS
+# ─────────────────────────────────────────
 def days_to_expiry(name):
     cfg     = SYMBOLS.get(name, {})
     exp_day = cfg.get("expiry_day")
@@ -410,9 +468,7 @@ def days_to_expiry(name):
     return diff if diff > 0 else 7
 
 def is_expiry_today(name):
-    cfg     = SYMBOLS.get(name, {})
-    exp_day = cfg.get("expiry_day")
-    return datetime.now(IST).weekday() == exp_day
+    return datetime.now(IST).weekday() == SYMBOLS.get(name, {}).get("expiry_day")
 
 def estimate_premium(spot, strike, opt_type, dte):
     iv        = 0.14
@@ -420,6 +476,9 @@ def estimate_premium(spot, strike, opt_type, dte):
     time_val  = round(spot * iv * max(dte, 1) / 365)
     return max(10, round(intrinsic + time_val))
 
+# ─────────────────────────────────────────
+# SIGNAL SCANNER
+# ─────────────────────────────────────────
 def scan_symbol(name):
     cfg      = SYMBOLS[name]
     interval = cfg["interval"]
@@ -427,10 +486,10 @@ def scan_symbol(name):
     try:
         df = yf.download(cfg["yahoo"], interval="5m", period="1d", progress=False, auto_adjust=True)
         if df.empty:
-            log.warning(f"{name}: No data")
+            log.warning(f"{name}: No data from yfinance")
             return None
         if not is_candle_fresh(df):
-            log.warning(f"{name}: stale candles")
+            log.warning(f"{name}: Stale candles (>20 min old) - skipping")
             return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
@@ -461,24 +520,29 @@ def scan_symbol(name):
             result   = strategy_momentum(df, atr, rsi)
             strategy = "Momentum"
         if result is None:
-            log.info(f"{name}: {regime} confirmed but no setup found")
+            log.info(f"{name}: {regime} confirmed but no setup - skip")
             return None
         direction, entry, sl_idx, tgt_idx, conf = result
         atm_strike = round(close / interval) * interval
         otm_strike = (atm_strike + interval) if direction == "CE" else (atm_strike - interval)
         dte        = days_to_expiry(name)
-        atm_prem   = get_live_premium(name, close, atm_strike, direction)
-        otm_prem   = get_live_premium(name, close, otm_strike, direction)
+
+        # Per-signal live flag — accurate tagging per request
+        atm_prem, atm_is_live = get_live_premium(name, close, atm_strike, direction)
+        otm_prem, _           = get_live_premium(name, close, otm_strike, direction)
+
         if is_expiry_today(name):
             sl_prem  = round(atm_prem * 0.35)
             tgt_prem = round(atm_prem * 1.60)
         else:
             sl_prem  = round(atm_prem * 0.45)
             tgt_prem = round(atm_prem * 1.90)
+
         risk_per_lot = max(1, (atm_prem - sl_prem) * lot)
         sugg_lots    = max(1, int((CAPITAL * RISK_PCT) / risk_per_lot))
         cost_per_lot = atm_prem * lot
-        return {
+
+        signal = {
             "id":           str(uuid.uuid4())[:8],
             "symbol":       name,
             "direction":    direction,
@@ -490,6 +554,7 @@ def scan_symbol(name):
             "otm_strike":   otm_strike,
             "atm_prem":     atm_prem,
             "otm_prem":     otm_prem,
+            "prem_is_live": atm_is_live,
             "sl_prem":      sl_prem,
             "tgt_prem":     tgt_prem,
             "sugg_lots":    sugg_lots,
@@ -506,10 +571,14 @@ def scan_symbol(name):
             "expiry_today": is_expiry_today(name),
             "yahoo":        cfg["yahoo"],
         }
+        return signal
     except Exception as e:
         log.error(f"{name}: scan_symbol error - {e}")
         return None
 
+# ─────────────────────────────────────────
+# SL / TARGET MONITOR
+# ─────────────────────────────────────────
 def check_sl_target():
     trade = get_st("active_trade")
     if not trade:
@@ -527,25 +596,36 @@ def check_sl_target():
         live    = float(df["Close"].dropna().iloc[-1])
         sl_hit  = (live <= sl)  if dire == "CE" else (live >= sl)
         tgt_hit = (live >= tgt) if dire == "CE" else (live <= tgt)
-        log.info(f"SL/Tgt - {sym}: live={live:.2f} SL={sl} Tgt={tgt}")
+        log.info(f"Monitor {sym}: live={live:.2f} | SL={sl} | Tgt={tgt}")
         if sl_hit:
             send_text(
-                f"STOP LOSS HIT\n\n{sym} {trade['atm_strike']} {dire}\n"
-                f"Index now: {live:,.2f}\nSL level: {sl:,.2f}\n\nEXIT NOW.")
+                f"STOP LOSS HIT\n\n"
+                f"{sym} {trade['atm_strike']} {dire}\n"
+                f"Index now : {live:,.2f}\n"
+                f"SL level  : {sl:,.2f}\n\n"
+                f"EXIT NOW - no waiting.")
             with _lock:
                 state["daily_loss"] += CAPITAL * RISK_PCT
                 state["active_trade"] = None
-            _save_locked()
+            _persist_state()
+            log.info(f"SL hit: {sym} {trade['atm_strike']} {dire}")
         elif tgt_hit:
             send_text(
-                f"TARGET HIT\n\n{sym} {trade['atm_strike']} {dire}\n"
-                f"Index now: {live:,.2f}\nTgt level: {tgt:,.2f}\n\nBOOK PROFIT NOW.")
+                f"TARGET HIT\n\n"
+                f"{sym} {trade['atm_strike']} {dire}\n"
+                f"Index now : {live:,.2f}\n"
+                f"Target    : {tgt:,.2f}\n\n"
+                f"BOOK PROFIT NOW.")
             with _lock:
                 state["active_trade"] = None
-            _save_locked()
+            _persist_state()
+            log.info(f"Target hit: {sym} {trade['atm_strike']} {dire}")
     except Exception as e:
         log.error(f"check_sl_target error: {e}")
 
+# ─────────────────────────────────────────
+# MESSAGE BUILDERS
+# ─────────────────────────────────────────
 def build_signal_msg(s):
     exp_line = ("EXPIRY DAY - SL tightened. Exit before 2:45 PM."
                 if s["expiry_today"] else f"{s['dte']} day(s) to expiry")
@@ -553,7 +633,7 @@ def build_signal_msg(s):
     block    = (
         f"\nActive trade: {active['symbol']} {active['atm_strike']} {active['direction']}\n"
         f"This signal is blocked until you close that trade." if active else "")
-    live_tag = "(live)" if DHAN_ACCESS_TOKEN else "(est.)"
+    live_tag = "(live)" if s.get("prem_is_live") else "(est.)"
     return (
         f"DHAN SIGNAL - {s['symbol']} {s['direction']}\n"
         f"------------------------------\n\n"
@@ -571,7 +651,7 @@ def build_signal_msg(s):
         f"Cost of 1 lot  : Rs.{s['cost_per_lot']:,} ({s['lot']} units x Rs.{s['atm_prem']})\n"
         f"Stop Loss      : Rs.{s['sl_prem']}\n"
         f"Target         : Rs.{s['tgt_prem']}\n"
-        f"Suggested      : {s['sugg_lots']} lot(s) Rs.{int(CAPITAL * RISK_PCT)} risk\n\n"
+        f"Suggested      : {s['sugg_lots']} lot(s)  |  Risk: Rs.{int(CAPITAL * RISK_PCT)}\n\n"
         f"{exp_line}{block}\n\n"
         f"Tap a button below"
     )
@@ -579,9 +659,11 @@ def build_signal_msg(s):
 def build_multi_summary(signals, best):
     lines = [f"{len(signals)} signals fired simultaneously\n"]
     for s in signals:
-        marker = "BEST ->" if s["symbol"] == best["symbol"] else "  -"
-        lines.append(f"{marker} {s['symbol']} {s['direction']} {s['atm_strike']}"
-                     f" | {s['regime']} | Conf:{s['confidence']}/8 | Rs.{s['atm_prem']}")
+        marker = "BEST ->" if s["symbol"] == best["symbol"] else "     -"
+        lines.append(
+            f"{marker} {s['symbol']} {s['direction']} {s['atm_strike']}"
+            f" | {s['regime']} | Conf:{s['confidence']}/8 | Rs.{s['atm_prem']}"
+        )
     lines.append("\nIndividual signals with buttons follow below")
     return "\n".join(lines)
 
@@ -590,32 +672,40 @@ def build_rules_msg(period):
     dl     = get_st("daily_loss")
     at_str = (f"Active trade: {at['symbol']} {at['atm_strike']} {at['direction']}"
               if at else "No active trade")
-    live_status = "Live premiums: ON (Dhan API)" if DHAN_ACCESS_TOKEN else "Live premiums: OFF (using estimate)"
+    live_str = "Live premiums: ON (Dhan API)" if DHAN_ACCESS_TOKEN else "Live premiums: OFF (estimates only)"
     if period == "open":
-        return (f"Dhan Signal Bot - Market Open\n\n"
-                f"{live_status}\n\n"
-                f"RULES\n"
-                f"1. ONE trade at a time\n"
-                f"2. Pick highest confidence signal\n"
-                f"3. Never override Stop Loss\n"
-                f"4. Exit all positions by 3:15 PM\n"
-                f"5. Daily loss limit Rs.{MAX_DAILY_LOSS:.0f} then stop\n"
-                f"6. Expiry day: tighter SL, earlier exit\n\n"
-                f"{at_str}")
+        return (
+            f"Dhan Signal Bot - Market Open\n\n"
+            f"{live_str}\n\n"
+            f"RULES\n"
+            f"1. ONE trade at a time\n"
+            f"2. Pick highest confidence signal\n"
+            f"3. Never override Stop Loss\n"
+            f"4. Exit all positions by 3:15 PM\n"
+            f"5. Daily loss limit Rs.{MAX_DAILY_LOSS:.0f} - then stop\n"
+            f"6. Expiry day: tighter SL, exit before 2:45 PM\n\n"
+            f"{at_str}"
+        )
     if period == "mid":
-        return (f"MIDDAY CHECK\n\n"
-                f"Daily loss used: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
-                f"{at_str}\n\nStay disciplined. No overtrading.")
+        return (
+            f"MIDDAY CHECK\n\n"
+            f"Daily loss : Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
+            f"{at_str}\n\n"
+            f"Stay disciplined. No overtrading."
+        )
     if period == "close":
-        return (f"PRE-CLOSE\n\n"
-                f"Daily loss used: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
-                f"{at_str}\n\nNo new trades after 3:00 PM.\n"
-                f"Close open trades before 3:15 PM.")
+        return (
+            f"PRE-CLOSE ALERT\n\n"
+            f"Daily loss : Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
+            f"{at_str}\n\n"
+            f"No new trades after 3:00 PM.\n"
+            f"Close all open trades before 3:15 PM."
+        )
     return ""
 
-def now_ist():
-    return datetime.now(IST)
-
+# ─────────────────────────────────────────
+# TIME UTILITIES
+# ─────────────────────────────────────────
 def time_str():
     return now_ist().strftime("%H:%M")
 
@@ -633,70 +723,97 @@ def is_trading_window():
     m = n.hour * 60 + n.minute
     return 9 * 60 + 20 <= m <= 15 * 60 + 25
 
+# ─────────────────────────────────────────
+# MAIN LOOP
+# ─────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  Dhan Signal Bot  -  Live Premiums via Dhan API")
+    log.info("  Dhan Signal Bot  -  Production Ready")
     log.info("=" * 55)
+
+    _load_state()   # Restore persisted state on startup
+
     poll = threading.Thread(target=telegram_polling_thread, daemon=True)
     poll.start()
+
     while True:
         n    = now_ist()
         t    = time_str()
         wday = n.weekday()
+
+        # ── Weekend ──────────────────────────────────────────
         if wday >= 5:
             if not get_st("holiday_sent"):
                 send_text("Market closed today. See you Monday!")
                 set_st("holiday_sent", True)
             time.sleep(3600)
             continue
+
+        # ── Daily reset ──────────────────────────────────────
         if get_st("current_day") != n.date():
             with _lock:
                 state.update({
-                    "current_day": n.date(), "daily_loss": 0.0,
-                    "active_trade": None, "pending_signals": {},
-                    "rules_sent": {"open": False, "mid": False, "close": False},
-                    "last_heartbeat_hour": -1, "holiday_sent": False,
+                    "current_day":         n.date(),
+                    "daily_loss":          0.0,
+                    "active_trade":        None,
+                    "pending_signals":     {},
+                    "rules_sent":          {"open": False, "mid": False, "close": False},
+                    "last_heartbeat_hour": -1,
+                    "holiday_sent":        False,
                 })
                 for nm in regime_state:
                     regime_state[nm] = {"last": None, "count": 0}
             _expiry_cache.clear()
-            log.info(f"New day: {n.date()}")
+            _persist_state()
+            log.info(f"New day reset: {n.date()}")
+
+        # ── Scheduled messages ───────────────────────────────
         rs = get_st("rules_sent")
         if "09:20" <= t < "09:30" and not rs["open"]:
             send_text(build_rules_msg("open"))
             with _lock:
                 state["rules_sent"]["open"] = True
-            _save_locked()
+            _persist_state()
+
         if "12:30" <= t < "12:40" and not rs["mid"]:
             send_text(build_rules_msg("mid"))
             with _lock:
                 state["rules_sent"]["mid"] = True
-            _save_locked()
+            _persist_state()
+
         if "15:00" <= t < "15:10" and not rs["close"]:
             send_text(build_rules_msg("close"))
             with _lock:
                 state["rules_sent"]["close"] = True
-            _save_locked()
+            _persist_state()
+
         if "15:30" <= t < "15:31":
             at = get_st("active_trade")
             dl = get_st("daily_loss")
             send_text(
-                f"Market Closed\n\nDaily loss: Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
-                f"Open trade: {at['symbol'] + ' ' + str(at['atm_strike']) if at else 'None'}\n\n"
-                f"See you tomorrow at 9:20 AM")
+                f"Market Closed\n\n"
+                f"Daily loss : Rs.{dl:.0f} / Rs.{MAX_DAILY_LOSS:.0f}\n"
+                f"Open trade : {at['symbol'] + ' ' + str(at['atm_strike']) if at else 'None'}\n\n"
+                f"See you tomorrow at 9:20 AM"
+            )
             set_st("active_trade", None)
+
+        # ── Trading window ───────────────────────────────────
         if is_trading_window():
             if get_st("daily_loss") >= MAX_DAILY_LOSS:
-                log.info("Daily loss limit - paused this cycle")
+                log.info("Daily loss limit reached - pausing this cycle")
                 wait_next_5min()
                 continue
+
             check_sl_target()
+
             try:
                 signals = []
                 for name in SYMBOLS:
                     result = scan_symbol(name)
                     if result:
                         signals.append(result)
+
                 if signals:
                     best = max(signals, key=lambda x: (STRATEGY_RANK.get(x["regime"], 0), x["confidence"]))
                     if len(signals) > 1:
@@ -705,11 +822,15 @@ def main():
                         msg_id = send_with_buttons(build_signal_msg(sig), sig["id"])
                         with _lock:
                             state["pending_signals"][sig["id"]] = {**sig, "msg_id": msg_id}
+                    _persist_state()   # Persist pending signals immediately
                 else:
                     log.info("No confirmed signals this scan")
+
             except Exception as e:
                 log.error(f"Main scan error: {e}")
+
         wait_next_5min()
+
 
 if __name__ == "__main__":
     main()
