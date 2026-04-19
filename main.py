@@ -1,6 +1,8 @@
 import os
 import time
 import uuid
+import json
+import sqlite3
 import logging
 import threading
 import requests
@@ -58,6 +60,39 @@ def get_st(key):
 def set_st(key, val):
     with _lock:
         state[key] = val
+        _save_locked()
+
+def _jsonable(v):
+    if isinstance(v, (str, int, float, bool)) or v is None:
+        return v
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _jsonable(x) for k, x in v.items()}
+    if isinstance(v, (date, datetime)):
+        return v.isoformat()
+    return str(v)
+
+def _persist_state():
+    payload = _jsonable(state)
+    with conn:
+        conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", ("state", json.dumps(payload)))
+
+def _load_state():
+    row = conn.execute("SELECT v FROM kv WHERE k='state'").fetchone()
+    if not row:
+        return
+    try:
+        saved = json.loads(row[0])
+        with _lock:
+            for k, v in saved.items():
+                if k in state:
+                    state[k] = v
+    except Exception as e:
+        log.error(f"state load error: {e}")
+
+def _save_locked():
+    _persist_state()
 
 _expiry_cache = {}
 
@@ -113,6 +148,8 @@ def get_live_premium(name, spot, strike, opt_type):
             },
             timeout=10,
         )
+        resp.raise_for_status()
+        resp.raise_for_status()
         data = resp.json()
         log.info(f"{name} Dhan response status: {data.get('status')} keys: {list(data.get('data', {}).keys())[:5]}")
         oc  = data.get("data", {}).get("oc", {})
@@ -207,7 +244,8 @@ def handle_callback(query):
                     f"Close that first.")
                 return
             state["active_trade"] = signal
-            del state["pending_signals"][signal_id]
+            state["pending_signals"].pop(signal_id, None)
+            _save_locked()
         answer_callback(cb_id, "Trade logged!")
         s = signal
         cost_per_lot = s["atm_prem"] * s["lot"]
@@ -219,7 +257,7 @@ def handle_callback(query):
             f"Cost of 1 lot    : Rs.{cost_per_lot:,} ({s['lot']} units)\n"
             f"Stop Loss        : Rs.{s['sl_prem']}\n"
             f"Target           : Rs.{s['tgt_prem']}\n\n"
-            f"Bot will notify when SL or Target is hit.")
+            f"Bot will monitor option premium for SL/Target.")
         log.info(f"Trade taken: {s['symbol']} {s['atm_strike']} {s['direction']}")
     elif action == "skip":
         with _lock:
@@ -261,6 +299,15 @@ def telegram_polling_thread():
         except Exception as e:
             log.error(f"Polling thread error: {e}")
             time.sleep(5)
+
+def is_candle_fresh(df, max_minutes=20):
+    try:
+        last = df.index[-1]
+        if getattr(last, "tzinfo", None) is None:
+            last = last.tz_localize(IST) if hasattr(last, "tz_localize") else last
+        return (now_ist() - last.to_pydatetime()).total_seconds() <= max_minutes * 60
+    except Exception:
+        return True
 
 def compute_indicators(df):
     df = df.copy()
@@ -382,6 +429,9 @@ def scan_symbol(name):
         if df.empty:
             log.warning(f"{name}: No data")
             return None
+        if not is_candle_fresh(df):
+            log.warning(f"{name}: stale candles")
+            return None
         if isinstance(df.columns, pd.MultiIndex):
             df.columns = df.columns.get_level_values(0)
         df = df.dropna()
@@ -485,12 +535,14 @@ def check_sl_target():
             with _lock:
                 state["daily_loss"] += CAPITAL * RISK_PCT
                 state["active_trade"] = None
+            _save_locked()
         elif tgt_hit:
             send_text(
                 f"TARGET HIT\n\n{sym} {trade['atm_strike']} {dire}\n"
                 f"Index now: {live:,.2f}\nTgt level: {tgt:,.2f}\n\nBOOK PROFIT NOW.")
             with _lock:
                 state["active_trade"] = None
+            _save_locked()
     except Exception as e:
         log.error(f"check_sl_target error: {e}")
 
@@ -614,14 +666,17 @@ def main():
             send_text(build_rules_msg("open"))
             with _lock:
                 state["rules_sent"]["open"] = True
+            _save_locked()
         if "12:30" <= t < "12:40" and not rs["mid"]:
             send_text(build_rules_msg("mid"))
             with _lock:
                 state["rules_sent"]["mid"] = True
+            _save_locked()
         if "15:00" <= t < "15:10" and not rs["close"]:
             send_text(build_rules_msg("close"))
             with _lock:
                 state["rules_sent"]["close"] = True
+            _save_locked()
         if "15:30" <= t < "15:31":
             at = get_st("active_trade")
             dl = get_st("daily_loss")
