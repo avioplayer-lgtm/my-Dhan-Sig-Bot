@@ -144,6 +144,11 @@ def get_next_expiry(scrip_id):
                 _expiry_cache[scrip_id] = (today, exp)
                 log.info(f"Dhan expiry for scrip {scrip_id}: {exp}")
                 return exp
+    except requests.exceptions.HTTPError as e:
+        try:
+            log.error(f"get_next_expiry HTTP {e.response.status_code}: {e.response.text}")
+        except Exception:
+            log.error(f"get_next_expiry HTTP error: {e}")
     except Exception as e:
         log.error(f"get_next_expiry error: {e}")
     return None
@@ -193,11 +198,16 @@ def get_live_premium(name, spot, strike, opt_type):
             ltp = option_data.get("last_price")
             if ltp and float(ltp) > 0:
                 log.info(f"{name} LIVE LTP {strike} {opt_type}: Rs.{ltp}")
-                return round(float(ltp)), True   # True = is_live
+                return round(float(ltp)), True
             else:
                 log.warning(f"{name}: LTP=0 for {strike} {opt_type} - using estimate")
         else:
             log.warning(f"{name}: No matching strike in option chain")
+    except requests.exceptions.HTTPError as e:
+        try:
+            log.error(f"get_live_premium HTTP {e.response.status_code}: {e.response.text}")
+        except Exception:
+            log.error(f"get_live_premium HTTP error: {e}")
     except Exception as e:
         log.error(f"get_live_premium error: {e}")
     return estimate_premium(spot, strike, opt_type, days_to_expiry(name)), False
@@ -523,26 +533,21 @@ def scan_symbol(name):
             log.info(f"{name}: {regime} confirmed but no setup - skip")
             return None
         direction, entry, sl_idx, tgt_idx, conf = result
-        atm_strike = round(close / interval) * interval
-        otm_strike = (atm_strike + interval) if direction == "CE" else (atm_strike - interval)
-        dte        = days_to_expiry(name)
-
-        # Per-signal live flag — accurate tagging per request
+        atm_strike    = round(close / interval) * interval
+        otm_strike    = (atm_strike + interval) if direction == "CE" else (atm_strike - interval)
+        dte           = days_to_expiry(name)
         atm_prem, atm_is_live = get_live_premium(name, close, atm_strike, direction)
         otm_prem, _           = get_live_premium(name, close, otm_strike, direction)
-
         if is_expiry_today(name):
             sl_prem  = round(atm_prem * 0.35)
             tgt_prem = round(atm_prem * 1.60)
         else:
             sl_prem  = round(atm_prem * 0.45)
             tgt_prem = round(atm_prem * 1.90)
-
         risk_per_lot = max(1, (atm_prem - sl_prem) * lot)
         sugg_lots    = max(1, int((CAPITAL * RISK_PCT) / risk_per_lot))
         cost_per_lot = atm_prem * lot
-
-        signal = {
+        return {
             "id":           str(uuid.uuid4())[:8],
             "symbol":       name,
             "direction":    direction,
@@ -571,7 +576,6 @@ def scan_symbol(name):
             "expiry_today": is_expiry_today(name),
             "yahoo":        cfg["yahoo"],
         }
-        return signal
     except Exception as e:
         log.error(f"{name}: scan_symbol error - {e}")
         return None
@@ -728,10 +732,12 @@ def is_trading_window():
 # ─────────────────────────────────────────
 def main():
     log.info("=" * 55)
-    log.info("  Dhan Signal Bot  -  Production Ready")
+    log.info("  Dhan Signal Bot  -  Production Ready v2")
     log.info("=" * 55)
+    log.info(f"DHAN_CLIENT_ID    : {'SET' if DHAN_CLIENT_ID else 'MISSING'}")
+    log.info(f"DHAN_ACCESS_TOKEN : {'SET (len=' + str(len(DHAN_ACCESS_TOKEN)) + ')' if DHAN_ACCESS_TOKEN else 'MISSING'}")
 
-    _load_state()   # Restore persisted state on startup
+    _load_state()
 
     poll = threading.Thread(target=telegram_polling_thread, daemon=True)
     poll.start()
@@ -741,7 +747,6 @@ def main():
         t    = time_str()
         wday = n.weekday()
 
-        # ── Weekend ──────────────────────────────────────────
         if wday >= 5:
             if not get_st("holiday_sent"):
                 send_text("Market closed today. See you Monday!")
@@ -749,7 +754,6 @@ def main():
             time.sleep(3600)
             continue
 
-        # ── Daily reset ──────────────────────────────────────
         if get_st("current_day") != n.date():
             with _lock:
                 state.update({
@@ -767,7 +771,6 @@ def main():
             _persist_state()
             log.info(f"New day reset: {n.date()}")
 
-        # ── Scheduled messages ───────────────────────────────
         rs = get_st("rules_sent")
         if "09:20" <= t < "09:30" and not rs["open"]:
             send_text(build_rules_msg("open"))
@@ -798,7 +801,6 @@ def main():
             )
             set_st("active_trade", None)
 
-        # ── Trading window ───────────────────────────────────
         if is_trading_window():
             if get_st("daily_loss") >= MAX_DAILY_LOSS:
                 log.info("Daily loss limit reached - pausing this cycle")
@@ -822,17 +824,12 @@ def main():
                         msg_id = send_with_buttons(build_signal_msg(sig), sig["id"])
                         with _lock:
                             state["pending_signals"][sig["id"]] = {**sig, "msg_id": msg_id}
-                    _persist_state()   # Persist pending signals immediately
+                    _persist_state()
                 else:
                     log.info("No confirmed signals this scan")
 
-             except requests.exceptions.HTTPError as e:
-        try:
-            log.error(f"get_next_expiry HTTP error: {e} | Response: {e.response.text}")
-        except Exception:
-            log.error(f"get_next_expiry HTTP error: {e}")
-    except Exception as e:
-        log.error(f"get_next_expiry error: {e}")
+            except Exception as e:
+                log.error(f"Main scan error: {e}")
 
         wait_next_5min()
 
