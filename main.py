@@ -18,8 +18,8 @@ load_dotenv()
 # ─────────────────────────────────────────
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 CHAT_ID           = os.environ.get("CHAT_ID")
-DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
+DHAN_CLIENT_ID    = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
+DHAN_ACCESS_TOKEN = (os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()
 
 if not BOT_TOKEN or not CHAT_ID:
     raise ValueError("BOT_TOKEN and CHAT_ID must be set as environment variables.")
@@ -826,8 +826,13 @@ def main():
                 else:
                     log.info("No confirmed signals this scan")
 
-            except Exception as e:
-                log.error(f"Main scan error: {e}")
+             except requests.exceptions.HTTPError as e:
+        try:
+            log.error(f"get_next_expiry HTTP error: {e} | Response: {e.response.text}")
+        except Exception:
+            log.error(f"get_next_expiry HTTP error: {e}")
+    except Exception as e:
+        log.error(f"get_next_expiry error: {e}")
 
         wait_next_5min()
 
