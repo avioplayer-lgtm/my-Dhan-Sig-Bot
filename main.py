@@ -1,9 +1,8 @@
 import os
 import time
-import uuid
 import json
-import sqlite3
 import logging
+import threading
 import requests
 import pandas as pd
 import pytz
@@ -13,99 +12,128 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ─────────────────────────────────────────
-# CONFIG & PERSISTENCE PATHS
+# CONFIG & 2026 PARAMETERS
 # ─────────────────────────────────────────
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 CHAT_ID           = os.environ.get("CHAT_ID")
 DHAN_CLIENT_ID    = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
 DHAN_ACCESS_TOKEN = (os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()
 
-# Change database path to the mounted volume for 24/7 persistence
-DB_DIR  = "/app/data" if os.path.exists("/app/data") else "."
-DB_PATH = os.path.join(DB_DIR, "state.db")
-SCRIP_FILE_PATH = os.path.join(DB_DIR, "dhan_scrip_master.csv")
-
 IST = pytz.timezone("Asia/Kolkata")
-CAPITAL = float(os.environ.get("CAPITAL", 30000))
+SAFE_MODE_TRIGGER = 4000.0  # Secures profit after 4k
+FLEXIBLE_TARGET   = 5000.0
 
+# 2026 Standard Lot Sizes
 SYMBOLS = {
     "NIFTY":     {"interval": 50,  "lot": 65,  "dhan_scrip": "13", "ws_scrip": 13, "segment": "IDX_I", "inst": "INDEX"},
     "BANKNIFTY": {"interval": 100, "lot": 30,  "dhan_scrip": "25", "ws_scrip": 25, "segment": "IDX_I", "inst": "INDEX"},
-    "CRUDEOIL":  {"interval": 100, "lot": 100, "dhan_scrip": None, "ws_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
-    "NATURALGAS":{"interval": 5,   "lot": 1250, "dhan_scrip": None, "ws_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
+    "CRUDEOIL":  {"interval": 100, "lot": 100, "dhan_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
+    "NATURALGAS":{"interval": 5,   "lot": 1250,"dhan_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
 }
 
-# ─────────────────────────────────────────
-# STATE & DATABASE (One-shot setup)
-# ─────────────────────────────────────────
-def init_db():
-    if not os.path.exists(DB_DIR): os.makedirs(DB_DIR)
-    c = sqlite3.connect(DB_PATH)
-    c.execute("CREATE TABLE IF NOT EXISTS kv (k TEXT PRIMARY KEY, v TEXT)")
-    c.commit()
-    return c
-
-conn = init_db()
-state = {"active_trade": None, "daily_pnl": 0.0, "is_sureshot": False, "last_reset_date": ""}
-
-def _persist():
-    with conn: conn.execute("INSERT OR REPLACE INTO kv (k, v) VALUES (?, ?)", ("state", json.dumps(state)))
-
-def _load():
-    row = conn.execute("SELECT v FROM kv WHERE k='state'").fetchone()
-    if row: state.update(json.loads(row[0]))
+DHAN_HEADERS = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
+SCRIP_FILE   = "dhan_scrip_master.csv"
 
 # ─────────────────────────────────────────
-# DAILY MAINTENANCE (The "Pre-Market" Routine)
+# GLOBAL STATE (RAM-BASED)
 # ─────────────────────────────────────────
-def daily_maintenance():
-    now_ist = datetime.now(IST)
-    today_str = now_ist.strftime("%Y-%m-%d")
+state = {
+    "daily_pnl": 0.0,
+    "is_sureshot": False,
+    "active_trade": None,
+    "paused": False,
+    "last_update_id": 0,
+    "breakeven_alerted": False
+}
 
-    # Reset PnL and refresh Scrips at 8:30 AM every day
-    if state["last_reset_date"] != today_str:
-        log.info(f"🌞 Good Morning. Performing daily maintenance for {today_str}...")
-        
-        # Reset Trading State
-        state["daily_pnl"] = 0.0
-        state["is_sureshot"] = False
-        state["last_reset_date"] = today_str
-        state["active_trade"] = None
-        
-        # Refresh Scrip Master for MCX Rollovers
-        update_symbols_from_master()
-        
-        send_text(f"🔋 *BOT ONLINE: {today_str}*\nScrips updated. P&L reset to 0. Ready for the opening bell.")
-        _persist()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("RailwayV10")
 
 # ─────────────────────────────────────────
-# CORE EXECUTION
+# INDICATORS & LOGIC
 # ─────────────────────────────────────────
-def main_loop():
-    _load()
-    log.info("🚀 24/7 Scalp Bot initialized.")
-    
+def calculate_rsi(series, period=14):
+    delta = series.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    return 100 - (100 / (1 + rs))
+
+def get_data(name):
+    cfg = SYMBOLS[name]
+    try:
+        payload = {
+            "securityId": cfg["dhan_scrip"], "exchangeSegment": cfg["segment"],
+            "instrument": cfg["inst"], "interval": "5", 
+            "fromDate": datetime.now(IST).date().isoformat(), 
+            "toDate": datetime.now(IST).date().isoformat()
+        }
+        resp = requests.post("https://api.dhan.co/v2/charts/intraday", headers=DHAN_HEADERS, json=payload, timeout=10)
+        d = resp.json()
+        df = pd.DataFrame({"Close": d["close"], "High": d["high"], "Low": d["low"], "Volume": d["volume"]},
+                          index=pd.to_datetime(d["timestamp"], unit="s", utc=True).tz_convert(IST))
+        df['ema9'] = df['Close'].ewm(span=9, adjust=False).mean()
+        df['ema21'] = df['Close'].ewm(span=21, adjust=False).mean()
+        df['rsi'] = calculate_rsi(df['Close'])
+        df['atr'] = (df['High'] - df['Low']).rolling(10).mean()
+        return df.dropna()
+    except: return None
+
+# ─────────────────────────────────────────
+# TELEGRAM COMMAND HANDLER
+# ─────────────────────────────────────────
+def send_text(txt):
+    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", json={"chat_id": CHAT_ID, "text": txt, "parse_mode": "Markdown"})
+
+def bot_listener():
+    """Listens for manual P&L sync or status requests."""
     while True:
         try:
-            now = datetime.now(IST)
-            
-            # 1. Run Maintenance
-            daily_maintenance()
-            
-            # 2. Market Monitoring (NSE/MCX Window)
-            if 9 * 60 + 0 <= now.hour * 60 + now.minute <= 23 * 45:
-                # [Previous monitor_active and scan_for_signals logic goes here]
-                pass
-            
-            # 3. Heartbeat (Every hour outside market hours)
-            elif now.minute == 0 and now.second < 30:
-                log.info("💤 Market closed. Bot heartbeat active.")
+            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={state['last_update_id'] + 1}", timeout=10).json()
+            for up in r.get("result", []):
+                state['last_update_id'] = up['update_id']
+                msg = up.get("message", {}).get("text", "")
+                
+                if "/status" in msg:
+                    mode = "🛡️ SURESHOT" if state["is_sureshot"] else "🚀 NORMAL"
+                    active = state["active_trade"]["symbol"] if state["active_trade"] else "None"
+                    send_text(f"*SYSTEM STATUS*\nMode: {mode}\nDaily P&L: ₹{state['daily_pnl']}\nActive Trade: {active}")
+                
+                if "/setpnl" in msg:
+                    try:
+                        val = float(msg.split(" ")[1])
+                        state["daily_pnl"] = val
+                        if val >= SAFE_MODE_TRIGGER: state["is_sureshot"] = True
+                        send_text(f"✅ P&L Synced to ₹{val}. Mode updated.")
+                    except: send_text("Format: `/setpnl 2500`")
+                    
+        except: pass
+        time.sleep(5)
 
-        except Exception as e:
-            log.error(f"⚠️ Runtime Error: {e}")
-            time.sleep(60) # Wait and retry
+# ─────────────────────────────────────────
+# MAIN TRADING ENGINE
+# ─────────────────────────────────────────
+def trading_cycle():
+    # Update Scrip IDs at start
+    # ... [Insert update_symbols_from_master logic here] ...
+    
+    while True:
+        now = datetime.now(IST)
+        # Check window (NSE Morning to MCX Night)
+        if 9 * 60 <= now.hour * 60 + now.minute <= 23 * 30:
             
-        time.sleep(20)
+            # Sureshot Transition
+            if state["daily_pnl"] >= SAFE_MODE_TRIGGER and not state["is_sureshot"]:
+                state["is_sureshot"] = True
+                send_text("⚠️ *TARGET REACHED*\nBot is now in Sureshot Mode (EMA + RSI + Vol confirmation required).")
+
+            # Scan and Monitor (logic from v8/v9)
+            # ...
+            
+        time.sleep(30)
 
 if __name__ == "__main__":
-    main_loop()
+    # Start Telegram Listener in background
+    threading.Thread(target=bot_listener, daemon=True).start()
+    send_text("🔋 *v10 ONLINE*\nRailway instance active. Use `/setpnl` if this was a mid-day restart.")
+    trading_cycle()
