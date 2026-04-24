@@ -27,8 +27,9 @@ FLEXIBLE_TARGET   = 5000.0
 SYMBOLS = {
     "NIFTY":     {"interval": 50,  "lot": 65,  "dhan_scrip": "13", "ws_scrip": 13, "segment": "IDX_I", "inst": "INDEX"},
     "BANKNIFTY": {"interval": 100, "lot": 30,  "dhan_scrip": "25", "ws_scrip": 25, "segment": "IDX_I", "inst": "INDEX"},
-    "CRUDEOIL":  {"interval": 100, "lot": 100, "dhan_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
-    "NATURALGAS":{"interval": 5,   "lot": 1250,"dhan_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
+    # If you want the bot to also track Commodities (MCX)
+    "CRUDEOIL":  {"interval": 100, "lot": 100, "dhan_scrip": None, "ws_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
+    "NATURALGAS":{"interval": 5,   "lot": 1250,"dhan_scrip": None, "ws_scrip": None, "segment": "MCX_COMM", "inst": "FUTCOM"},
 }
 
 DHAN_HEADERS = {"access-token": DHAN_ACCESS_TOKEN, "client-id": DHAN_CLIENT_ID, "Content-Type": "application/json"}
