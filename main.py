@@ -11,9 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ─────────────────────────────────────────
-# 1. CONFIGURATION
-# ─────────────────────────────────────────
+# CONFIG
 BOT_TOKEN         = os.environ.get("BOT_TOKEN")
 CHAT_ID           = os.environ.get("CHAT_ID")
 DHAN_CLIENT_ID    = (os.environ.get("DHAN_CLIENT_ID") or "").strip()
@@ -40,9 +38,7 @@ DHAN_HEADERS = {
 SCRIP_MASTER_URL = "https://images.dhan.co/api-data/api-scrip-master.csv"
 SCRIP_FILE_PATH  = "dhan_scrip_master.csv"
 
-# ─────────────────────────────────────────
-# 2. LOGGING
-# ─────────────────────────────────────────
+# LOGGING
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -50,24 +46,20 @@ logging.basicConfig(
 )
 log = logging.getLogger("WarriorV13")
 
-# ─────────────────────────────────────────
-# 3. GLOBAL STATE
-# ─────────────────────────────────────────
+# STATE
 state = {
-    "daily_pnl":      0.0,
-    "is_sureshot":    False,
-    "active_trade":   None,
-    "last_update_id": 0,
-    "tsl_stage":      0,       # 0:None 1:Cost 2:ProfitLock 3:EMATrail 4:TargetExt
-    "paused":         False,
+    "daily_pnl":       0.0,
+    "is_sureshot":     False,
+    "active_trade":    None,
+    "last_update_id":  0,
+    "tsl_stage":       0,
+    "paused":          False,
     "pending_signals": {},
 }
 
-# ─────────────────────────────────────────
-# 4. SCRIP MASTER
-# ─────────────────────────────────────────
+# SCRIP MASTER
 def update_symbols_from_master():
-    log.info("Refreshing Scrip Master for active contracts...")
+    log.info("Refreshing Scrip Master...")
     try:
         if os.path.exists(SCRIP_FILE_PATH):
             age = datetime.now() - datetime.fromtimestamp(os.path.getmtime(SCRIP_FILE_PATH))
@@ -89,13 +81,11 @@ def update_symbols_from_master():
                     active = subset.sort_values("SEM_EXPIRY_DATE").iloc[0]
                     cfg["dhan_scrip"] = str(int(active["SEM_SMST_SECURITY_ID"]))
                     cfg["ws_scrip"]   = int(active["SEM_SMST_SECURITY_ID"])
-                    log.info(f"Set {name} -> {cfg['dhan_scrip']} ({active['SEM_TRADING_SYMBOL']})")
+                    log.info("Set %s -> %s (%s)", name, cfg["dhan_scrip"], active["SEM_TRADING_SYMBOL"])
     except Exception as e:
-        log.error(f"Master update failed: {e}")
+        log.error("Master update failed: %s", e)
 
-# ─────────────────────────────────────────
-# 5. DHAN DATA
-# ─────────────────────────────────────────
+# DHAN DATA
 def get_next_expiry(name):
     now        = datetime.now(IST)
     target_day = SYMBOLS[name]["expiry_day"]
@@ -137,7 +127,7 @@ def get_data(name):
         df["rsi"]   = 100 - (100 / (1 + gain / loss.replace(0, 1e-9)))
         return df.dropna()
     except Exception as e:
-        log.error(f"get_data {name}: {e}")
+        log.error("get_data %s: %s", name, e)
         return None
 
 def get_ltp(name):
@@ -152,71 +142,61 @@ def get_ltp(name):
         )
         return float(resp.json()["data"][seg_key][str(cfg["ws_scrip"])]["last_price"])
     except Exception as e:
-        log.error(f"get_ltp {name}: {e}")
+        log.error("get_ltp %s: %s", name, e)
         return None
 
-# ─────────────────────────────────────────
-# 6. TELEGRAM
-# ─────────────────────────────────────────
+# TELEGRAM
 def send_text(txt):
     try:
         requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
             json={"chat_id": CHAT_ID, "text": txt, "parse_mode": "Markdown"},
             timeout=10,
         )
     except Exception as e:
-        log.error(f"send_text error: {e}")
+        log.error("send_text: %s", e)
 
-def send_signal_with_buttons(sig_id, name, dire, entry, sl, tgt, atr):
-    expiry = get_next_expiry(name) if SYMBOLS[name]["segment"] == "IDX_I" else "MONTHLY"
+def send_signal_with_buttons(sig_id, name, dire, entry, sl, tgt):
+    expiry   = get_next_expiry(name) if SYMBOLS[name]["segment"] == "IDX_I" else "MONTHLY"
+    mode_lbl = "Sureshot" if state["is_sureshot"] else "Normal"
     msg = (
-        f"*BUY {name} {dire}*
-"
-        f"Expiry    : {expiry}
-"
-        f"----------------------------
-"
-        f"Buy At    : {entry:.2f}
-"
-        f"Target    : {tgt:.2f}
-"
-        f"Stop Loss : {sl:.2f}
-"
-        f"----------------------------
-"
-        f"Mode      : {'Sureshot' if state['is_sureshot'] else 'Normal'}
-"
-        f"Bot will manage TSL and Targets automatically."
+        "*BUY " + name + " " + dire + "*\n"
+        "Expiry    : " + expiry + "\n"
+        "----------------------------\n"
+        "Buy At    : " + "{:.2f}".format(entry) + "\n"
+        "Target    : " + "{:.2f}".format(tgt) + "\n"
+        "Stop Loss : " + "{:.2f}".format(sl) + "\n"
+        "----------------------------\n"
+        "Mode      : " + mode_lbl + "\n"
+        "Bot manages TSL and Targets."
     )
     kb = {
         "inline_keyboard": [[
-            {"text": "Take Trade", "callback_data": f"take|{sig_id}"},
-            {"text": "Skip",       "callback_data": f"skip|{sig_id}"},
+            {"text": "Take Trade", "callback_data": "take|" + sig_id},
+            {"text": "Skip",       "callback_data": "skip|" + sig_id},
         ]]
     }
     try:
         requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            "https://api.telegram.org/bot" + BOT_TOKEN + "/sendMessage",
             json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown", "reply_markup": kb},
             timeout=10,
         )
     except Exception as e:
-        log.error(f"send_signal_with_buttons error: {e}")
+        log.error("send_signal_with_buttons: %s", e)
 
 def bot_listener():
     log.info("Telegram command listener active.")
     while True:
         try:
             r = requests.get(
-                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                "https://api.telegram.org/bot" + BOT_TOKEN + "/getUpdates",
                 params={"offset": state["last_update_id"] + 1, "timeout": 25},
                 timeout=30,
             ).json()
             for up in r.get("result", []):
                 state["last_update_id"] = up["update_id"]
 
-                # ── Button callbacks ──────────────────────────
                 if "callback_query" in up:
                     cb     = up["callback_query"]
                     parts  = cb["data"].split("|")
@@ -225,13 +205,13 @@ def bot_listener():
                     if action == "take" and sig_id in state["pending_signals"]:
                         state["active_trade"] = state["pending_signals"].pop(sig_id)
                         state["tsl_stage"]    = 0
-                        send_text(f"Trade Confirmed: Monitoring {state['active_trade']['symbol']}...")
-                        log.info(f"Trade taken: {state['active_trade']['symbol']} {state['active_trade']['direction']}")
+                        sym = state["active_trade"]["symbol"]
+                        send_text("Trade Confirmed: Monitoring " + sym + "...")
+                        log.info("Trade taken: %s %s", sym, state["active_trade"]["direction"])
                     elif action == "skip":
                         state["pending_signals"].pop(sig_id, None)
                         send_text("Signal skipped.")
 
-                # ── Text commands ─────────────────────────────
                 msg = up.get("message", {}).get("text", "")
                 if not msg:
                     continue
@@ -240,173 +220,143 @@ def bot_listener():
                     mode = "SURESHOT" if state["is_sureshot"] else "NORMAL"
                     at   = state["active_trade"]["symbol"] if state["active_trade"] else "None"
                     send_text(
-                        f"*WARRIOR STATUS*
-"
-                        f"Mode      : {mode}
-"
-                        f"Daily P&L : Rs.{state['daily_pnl']:.0f}
-"
-                        f"Active    : {at}
-"
-                        f"TSL Stage : {state['tsl_stage']}
-"
-                        f"Paused    : {state['paused']}"
+                        "*WARRIOR STATUS*\n"
+                        "Mode      : " + mode + "\n"
+                        "Daily P&L : Rs." + "{:.0f}".format(state["daily_pnl"]) + "\n"
+                        "Active    : " + at + "\n"
+                        "TSL Stage : " + str(state["tsl_stage"]) + "\n"
+                        "Paused    : " + str(state["paused"])
                     )
                 elif "/setpnl" in msg:
                     try:
                         val = float(msg.split(" ")[1])
                         state["daily_pnl"]   = val
                         state["is_sureshot"] = val >= SAFE_MODE_TRIGGER
-                        send_text(f"P&L set to Rs.{val:.0f}. Mode: {'Sureshot' if state['is_sureshot'] else 'Normal'}")
+                        lbl = "Sureshot" if state["is_sureshot"] else "Normal"
+                        send_text("P&L set to Rs." + "{:.0f}".format(val) + ". Mode: " + lbl)
                     except Exception:
                         send_text("Format: /setpnl 2500")
                 elif "/exited" in msg:
-                    at = state["active_trade"]
+                    at  = state["active_trade"]
+                    sym = at["symbol"] if at else "None"
                     state["active_trade"] = None
                     state["tsl_stage"]    = 0
-                    sym = at["symbol"] if at else "None"
-                    send_text(f"Trade cleared: {sym}. Ready for next signal.")
-                    log.info(f"Trade manually exited: {sym}")
+                    send_text("Trade cleared: " + sym + ". Ready for next signal.")
+                    log.info("Trade manually exited: %s", sym)
                 elif "/pause" in msg:
                     state["paused"] = True
-                    send_text("Bot scanning PAUSED. /resume to restart.")
+                    send_text("Bot scanning PAUSED. Use /resume to restart.")
                 elif "/resume" in msg:
                     state["paused"] = False
                     send_text("Bot scanning RESUMED.")
                 elif "/cancel" in msg:
                     count = len(state["pending_signals"])
                     state["pending_signals"] = {}
-                    send_text(f"Cancelled {count} pending signal(s).")
+                    send_text("Cancelled " + str(count) + " pending signal(s).")
                 elif "/help" in msg:
                     send_text(
-                        "*Warrior v13 Commands*
-
-"
-                        "/status  — Bot state, mode, active trade
-"
-                        "/setpnl  — Sync daily P&L e.g. /setpnl 2500
-"
-                        "/exited  — Manually close active trade
-"
-                        "/pause   — Pause signal scanning
-"
-                        "/resume  — Resume signal scanning
-"
-                        "/cancel  — Cancel pending signals
-"
-                        "/help    — This list"
+                        "*Warrior v13 Commands*\n\n"
+                        "/status  - Bot state, mode, active trade\n"
+                        "/setpnl  - Sync daily P&L e.g. /setpnl 2500\n"
+                        "/exited  - Manually close active trade\n"
+                        "/pause   - Pause signal scanning\n"
+                        "/resume  - Resume signal scanning\n"
+                        "/cancel  - Cancel pending signals\n"
+                        "/help    - This list"
                     )
         except requests.exceptions.Timeout:
             pass
         except Exception as e:
-            log.error(f"bot_listener error: {e}")
+            log.error("bot_listener error: %s", e)
             time.sleep(5)
 
-# ─────────────────────────────────────────
-# 7. TSL ENGINE
-# ─────────────────────────────────────────
+# TSL ENGINE
 def monitor_active_trade():
-    t    = state["active_trade"]
+    t = state["active_trade"]
     if not t:
         return
     live = get_ltp(t["symbol"])
     if live is None:
-        log.warning(f"LTP unavailable for {t['symbol']}")
+        log.warning("LTP unavailable for %s", t["symbol"])
         return
-
     atr  = t["atr"]
-    move = (live - t["entry"]) if t["direction"] == "CE" else (t["entry"] - live)
+    dire = t["direction"]
+    move = (live - t["entry"]) if dire == "CE" else (t["entry"] - live)
 
-    # Stage 1 — Move SL to cost at 0.3 ATR
     if state["tsl_stage"] == 0 and move >= atr * 0.3:
         state["tsl_stage"] = 1
         t["sl"] = t["entry"]
-        send_text(f"SAFE PLAY
-{t['symbol']} in green. SL moved to COST ({t['entry']:.2f}).")
-        log.info(f"TSL Stage 1: {t['symbol']} SL -> cost {t['entry']:.2f}")
+        send_text("SAFE PLAY\n" + t["symbol"] + " in green. SL moved to cost " + "{:.2f}".format(t["entry"]) + ".")
+        log.info("TSL Stage 1: %s SL -> cost %.2f", t["symbol"], t["entry"])
 
-    # Stage 3 — EMA trail at 1.2 ATR
     df = None
     if move >= atr * 1.2:
         df = get_data(t["symbol"])
         if df is not None:
             state["tsl_stage"] = 3
             new_sl = float(df.iloc[-1]["ema9"])
-            if t["direction"] == "CE":
-                t["sl"] = max(t["sl"], new_sl)
-            else:
-                t["sl"] = min(t["sl"], new_sl)
-            log.info(f"TSL Stage 3: {t['symbol']} EMA trail SL -> {t['sl']:.2f}")
+            t["sl"] = max(t["sl"], new_sl) if dire == "CE" else min(t["sl"], new_sl)
+            log.info("TSL Stage 3: %s EMA trail SL -> %.2f", t["symbol"], t["sl"])
 
-    # Stage 4 — Target extension on strong RSI
-    hit_tgt = (live >= t["tgt"]) if t["direction"] == "CE" else (live <= t["tgt"])
+    hit_tgt = (live >= t["tgt"]) if dire == "CE" else (live <= t["tgt"])
     if hit_tgt:
         if df is None:
             df = get_data(t["symbol"])
         rsi_val   = float(df.iloc[-1]["rsi"]) if df is not None else 50
-        is_strong = rsi_val > 65 if t["direction"] == "CE" else rsi_val < 35
+        is_strong = rsi_val > 65 if dire == "CE" else rsi_val < 35
         if is_strong and state["tsl_stage"] < 4:
             state["tsl_stage"] = 4
             old_tgt  = t["tgt"]
-            t["tgt"] = old_tgt + atr * 0.5 if t["direction"] == "CE" else old_tgt - atr * 0.5
+            t["tgt"] = old_tgt + atr * 0.5 if dire == "CE" else old_tgt - atr * 0.5
             t["sl"]  = old_tgt
             send_text(
-                f"MOMENTUM EXTENSION
-"
-                f"{t['symbol']} target hit but RSI={rsi_val:.0f} is strong.
-"
-                f"New Target : {t['tgt']:.2f}
-"
-                f"SL locked  : {old_tgt:.2f}"
+                "MOMENTUM EXTENSION\n"
+                + t["symbol"] + " target hit. RSI=" + "{:.0f}".format(rsi_val) + " strong.\n"
+                + "New Target : " + "{:.2f}".format(t["tgt"]) + "\n"
+                + "SL locked  : " + "{:.2f}".format(old_tgt)
             )
-            log.info(f"TSL Stage 4 extension: {t['symbol']} new tgt={t['tgt']:.2f}")
+            log.info("TSL Stage 4: %s extended tgt=%.2f", t["symbol"], t["tgt"])
             return
         else:
-            send_text(f"TARGET HIT
-{t['symbol']} at {live:.2f}.
-Send /exited to reset.")
-            log.info(f"Target hit: {t['symbol']} at {live:.2f}")
+            send_text("TARGET HIT\n" + t["symbol"] + " at " + "{:.2f}".format(live) + ".\nSend /exited to reset.")
+            log.info("Target hit: %s at %.2f", t["symbol"], live)
             state["active_trade"] = None
             state["tsl_stage"]    = 0
             return
 
-    # SL check
-    hit_sl = (live <= t["sl"]) if t["direction"] == "CE" else (live >= t["sl"])
+    hit_sl = (live <= t["sl"]) if dire == "CE" else (live >= t["sl"])
     if hit_sl:
-        send_text(f"EXIT SIGNAL
-{t['symbol']} SL/TSL hit at {live:.2f}.
-Send /exited to reset.")
-        log.info(f"SL hit: {t['symbol']} at {live:.2f}")
+        send_text("EXIT SIGNAL\n" + t["symbol"] + " SL/TSL hit at " + "{:.2f}".format(live) + ".\nSend /exited to reset.")
+        log.info("SL hit: %s at %.2f", t["symbol"], live)
         state["active_trade"] = None
         state["tsl_stage"]    = 0
+        return
 
-    log.info(f"Monitor {t['symbol']}: live={live:.2f} | SL={t['sl']:.2f} | Tgt={t['tgt']:.2f} | TSL={state['tsl_stage']}")
+    log.info("Monitor %s: live=%.2f | SL=%.2f | Tgt=%.2f | TSL=%d",
+             t["symbol"], live, t["sl"], t["tgt"], state["tsl_stage"])
 
-# ─────────────────────────────────────────
-# 8. PRIORITY SCANNER
-# ─────────────────────────────────────────
+# PRIORITY SCANNER
 def run_scanner():
     now           = datetime.now(IST)
     mins          = now.hour * 60 + now.minute
     is_nse_window = (9 * 60 + 15) <= mins <= (15 * 60 + 30)
     scan_list     = ["NIFTY", "BANKNIFTY"] if is_nse_window else ["CRUDEOIL", "NATURALGAS"]
-
-    log.info(f"Scanner running: {scan_list} | {'NSE' if is_nse_window else 'MCX'} window")
+    log.info("Scanner: %s | %s window", scan_list, "NSE" if is_nse_window else "MCX")
 
     for name in scan_list:
         cfg = SYMBOLS[name]
         if cfg["dhan_scrip"] is None:
-            log.warning(f"{name}: scrip ID not set - skipping")
+            log.warning("%s: scrip ID not set - skipping", name)
             continue
         df = get_data(name)
         if df is None or len(df) < 21:
             continue
-        last = df.iloc[-1]
-        dire = None
-
-        if last["ema9"] > last["ema21"] and last["rsi"] > 55 and last["Volume"] > df["Volume"].tail(5).mean():
+        last    = df.iloc[-1]
+        vol_avg = df["Volume"].tail(5).mean()
+        dire    = None
+        if last["ema9"] > last["ema21"] and last["rsi"] > 55 and last["Volume"] > vol_avg:
             dire = "CE"
-        elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["Volume"] > df["Volume"].tail(5).mean():
+        elif last["ema9"] < last["ema21"] and last["rsi"] < 45 and last["Volume"] > vol_avg:
             dire = "PE"
 
         if dire:
@@ -416,54 +366,34 @@ def run_scanner():
             tgt    = entry + atr * 1.5 if dire == "CE" else entry - atr * 1.5
             sig_id = uuid.uuid4().hex[:6]
             state["pending_signals"][sig_id] = {
-                "symbol":    name,
-                "direction": dire,
-                "entry":     entry,
-                "sl":        sl,
-                "tgt":       tgt,
-                "atr":       atr,
-                "segment":   cfg["segment"],
+                "symbol": name, "direction": dire, "entry": entry,
+                "sl": sl, "tgt": tgt, "atr": atr, "segment": cfg["segment"],
             }
-            send_signal_with_buttons(sig_id, name, dire, entry, sl, tgt, atr)
-            log.info(f"Signal: {name} {dire} | Entry:{entry:.2f} SL:{sl:.2f} Tgt:{tgt:.2f}")
-            break  # one signal at a time
+            send_signal_with_buttons(sig_id, name, dire, entry, sl, tgt)
+            log.info("Signal: %s %s | Entry:%.2f SL:%.2f Tgt:%.2f", name, dire, entry, sl, tgt)
+            break
 
-# ─────────────────────────────────────────
-# 9. MAIN LOOP
-# ─────────────────────────────────────────
+# MAIN LOOP
 def main_loop():
     update_symbols_from_master()
-    send_text("*v13 WARRIOR ONLINE*
-Monitoring Nifty, BankNifty & MCX. Ready.")
+    send_text("*v13 WARRIOR ONLINE*\nMonitoring Nifty, BankNifty and MCX. Ready.")
     log.info("Main loop started")
-
     last_scan_minute = -1
-
     while True:
         now  = datetime.now(IST)
         mins = now.hour * 60 + now.minute
         m    = now.minute
-
-        # Window: 9:10 AM to 11:30 PM covers NSE + MCX
         in_window = (9 * 60 + 10) <= mins <= (23 * 60 + 30)
-
         if in_window:
-            # Sureshot mode trigger
             if state["daily_pnl"] >= SAFE_MODE_TRIGGER and not state["is_sureshot"]:
                 state["is_sureshot"] = True
-                send_text("SURESHOT MODE ON
-Profit target crossed. Tighter criteria active.")
+                send_text("SURESHOT MODE ON\nProfit target crossed. Tighter criteria active.")
                 log.info("Switched to Sureshot mode")
-
-            # Monitor active trade every 20s
             if state["active_trade"]:
                 monitor_active_trade()
-
-            # Scan every 5 min — use last_scan_minute to avoid missing window
             elif not state["paused"] and m % 5 == 0 and m != last_scan_minute:
                 last_scan_minute = m
                 run_scanner()
-
         time.sleep(20)
 
 
@@ -471,7 +401,7 @@ if __name__ == "__main__":
     log.info("=" * 50)
     log.info("  Dhan Warrior Bot  -  v13")
     log.info("=" * 50)
-    log.info(f"DHAN_CLIENT_ID    : {'SET' if DHAN_CLIENT_ID else 'MISSING'}")
-    log.info(f"DHAN_ACCESS_TOKEN : {'SET (len=' + str(len(DHAN_ACCESS_TOKEN)) + ')' if DHAN_ACCESS_TOKEN else 'MISSING'}")
+    log.info("DHAN_CLIENT_ID    : %s", "SET" if DHAN_CLIENT_ID else "MISSING")
+    log.info("DHAN_ACCESS_TOKEN : %s", ("SET (len=" + str(len(DHAN_ACCESS_TOKEN)) + ")") if DHAN_ACCESS_TOKEN else "MISSING")
     threading.Thread(target=bot_listener, daemon=True).start()
     main_loop()
