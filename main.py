@@ -288,11 +288,12 @@ def is_valid_trading_time():
 
 # ================= SCANNER =================
 def run_scanner():
-    if not is_valid_trading_time():
-    print("⏰ Outside trading window. Skipping...")
-    return
-    
     try:
+        # ✅ TIME FILTER (CORRECT INDENTATION)
+        if not is_valid_trading_time():
+            print("⏰ Outside trading window. Skipping...")
+            return
+
         print("🔍 Optimized Scanner Running...")
 
         for symbol in ["NIFTY", "BANKNIFTY"]:
