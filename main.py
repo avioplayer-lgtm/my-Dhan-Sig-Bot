@@ -12,8 +12,8 @@ load_dotenv()
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID   = os.environ.get("CHAT_ID")
 
-DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID") or "").strip()
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN") or "").strip()
+DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID")
+DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN")
 
 IST = pytz.timezone("Asia/Kolkata")
 
