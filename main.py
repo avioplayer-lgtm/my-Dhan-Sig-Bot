@@ -33,7 +33,15 @@ state = {
     "pending_signals": {},
     "last_update_id": 0,
     "paused": False,
-    "tsl_stage": 0
+    "tsl_stage": 0,
+
+    # NEW
+    "last_trade": None,
+    "reentry_count": 0,
+    "max_reentries": 1,
+    "daily_pnl": 0,
+    "max_loss": -1500,
+    "target_lock": 3000
 }
 
 # ================= TELEGRAM =================
@@ -200,25 +208,36 @@ def monitor_trade():
             return
 
         price = df.iloc[-1]["Close"]
-        atr = t["atr"]
+        atr   = t["atr"]
+
         move = price - t["entry"] if t["direction"] == "CE" else t["entry"] - price
 
-        # Move SL to cost
+        # ===== MOVE SL TO COST =====
         if state["tsl_stage"] == 0 and move > atr * 0.3:
             state["tsl_stage"] = 1
             t["sl"] = t["entry"]
-            send("SL moved to cost")
+            send("🟢 SL moved to cost")
 
-        # Target hit
+        # ===== TARGET HIT =====
         if (price >= t["tgt"] and t["direction"]=="CE") or (price <= t["tgt"] and t["direction"]=="PE"):
-            send("Target Hit")
+            send("🎯 Target Hit")
+
             state["active_trade"] = None
             state["tsl_stage"] = 0
+
+            # RESET RE-ENTRY
+            state["last_trade"] = None
+            state["reentry_count"] = 0
             return
 
-        # SL hit
+        # ===== SL HIT =====
         if (price <= t["sl"] and t["direction"]=="CE") or (price >= t["sl"] and t["direction"]=="PE"):
-            send("SL Hit")
+            send("❌ SL Hit")
+
+            # STORE FOR RE-ENTRY
+            state["last_trade"] = t.copy()
+            state["reentry_count"] += 1
+
             state["active_trade"] = None
             state["tsl_stage"] = 0
             return
@@ -249,75 +268,131 @@ def bot_listener():
 
         except:
             time.sleep(5)
+            
+# ================= Time based trading filter =================
+
+def is_valid_trading_time():
+    now = datetime.now(IST)
+
+    minutes = now.hour * 60 + now.minute
+
+    # Opening window
+    if (9 * 60 + 20) <= minutes <= (11 * 60 + 15):
+        return True
+
+    # Afternoon window
+    if (13 * 60 + 30) <= minutes <= (15 * 60 + 15):
+        return True
+
+    return False
 
 # ================= SCANNER =================
 def run_scanner():
+    if not is_valid_trading_time():
+    print("⏰ Outside trading window. Skipping...")
+    return
+    
     try:
-        print("🔍 Scanner cycle running...")
+        print("🔍 Optimized Scanner Running...")
 
         for symbol in ["NIFTY", "BANKNIFTY"]:
 
-            print(f"\nChecking {symbol}...")
-
-            # ===== GET PRICE DATA =====
             df = get_data(symbol)
-            if df is None or len(df) < 20:
-                print(f"{symbol}: Not enough data")
+            if df is None or len(df) < 30:
                 continue
 
-            # ===== SMC DETECTION =====
+            last = df.iloc[-1]
+            prev = df.iloc[-2]
+
+            ema9  = last["ema9"]
+            ema21 = last["ema21"]
+            atr   = last["atr"]
+
+            if atr == 0 or pd.isna(atr):
+                continue
+
+            # ===== TREND =====
+            trend_up   = ema9 > ema21
+            trend_down = ema9 < ema21
+            ema_gap    = abs(ema9 - ema21)
+            strong_trend = ema_gap > atr * 0.2
+
+            # ===== PULLBACK =====
+            pullback_up = prev["Close"] < prev["ema9"] and last["Close"] > ema9
+            pullback_dn = prev["Close"] > prev["ema9"] and last["Close"] < ema9
+
+            # ===== VOLATILITY =====
+            atr_avg = df["atr"].rolling(20).mean().iloc[-1]
+            high_vol = atr > atr_avg * 1.1
+
+            # ===== STRUCTURE =====
             smc = detect_smc(df)
-            print(f"{symbol}: SMC = {smc}")
-
-            if not smc:
-                continue
 
             # ===== OPTION CHAIN =====
             chain = get_option_chain(symbol)
+            oi_bias = analyze_oi(chain) if chain else "NEUTRAL"
 
-            if not chain:
-                print(f"{symbol}: No option chain data")
-                oi_bias = "NEUTRAL"
-            else:
-                oi_bias = analyze_oi(chain)
+            # ===== SCORING =====
+            score_up = 0
+            score_dn = 0
 
-            print(f"{symbol}: OI Bias = {oi_bias}")
+            if trend_up: score_up += 1
+            if strong_trend: score_up += 1
+            if pullback_up: score_up += 2
+            if smc == "BOS_UP": score_up += 2
+            if high_vol: score_up += 1
+            if oi_bias == "BULLISH": score_up += 1
 
-            # ===== DIRECTION DECISION =====
+            if trend_down: score_dn += 1
+            if strong_trend: score_dn += 1
+            if pullback_dn: score_dn += 2
+            if smc == "BOS_DOWN": score_dn += 2
+            if high_vol: score_dn += 1
+            if oi_bias == "BEARISH": score_dn += 1
+
             direction = None
-
-            # 🔥 Slightly aggressive logic (better signal frequency)
-            if smc == "BOS_UP":
+            if score_up >= 5:
                 direction = "CE"
-
-            elif smc == "BOS_DOWN":
+            elif score_dn >= 5:
                 direction = "PE"
 
             if not direction:
-                print(f"{symbol}: No direction")
                 continue
 
-            # ===== STRIKE SELECTION =====
-            strike = "ATM"
-
-            if chain:
-                strike = select_strike(chain, direction)
-
-            print(f"{symbol}: Direction = {direction}, Strike = {strike}")
-
-            # ===== ENTRY / SL / TARGET =====
-            last = df.iloc[-1]
             entry = float(last["Close"])
-            atr   = float(last["atr"])
-
-            if atr == 0 or pd.isna(atr):
-                print(f"{symbol}: Invalid ATR")
-                continue
-
             sl  = entry - atr if direction == "CE" else entry + atr
             tgt = entry + (2 * atr) if direction == "CE" else entry - (2 * atr)
 
-            # ===== CREATE SIGNAL =====
+            # ===== 🔁 RE-ENTRY =====
+            lt = state.get("last_trade")
+
+            if lt and state["reentry_count"] <= state["max_reentries"]:
+                if lt["symbol"] == symbol and lt["direction"] == direction:
+
+                    reentry_zone = abs(entry - lt["entry"]) < lt["atr"] * 0.5
+
+                    if reentry_zone:
+                        print("🔁 RE-ENTRY SIGNAL")
+
+                        sig_id = uuid.uuid4().hex[:6]
+
+                        state["pending_signals"][sig_id] = {
+                            "symbol": symbol,
+                            "direction": direction,
+                            "entry": entry,
+                            "sl": sl,
+                            "tgt": tgt,
+                            "atr": atr
+                        }
+
+                        send_signal(sig_id, symbol, direction, "RE-ENTRY", entry, sl, tgt)
+                        continue
+
+            # ===== NORMAL SIGNAL =====
+            strike = "ATM"
+            if chain:
+                strike = select_strike(chain, direction)
+
             sig_id = uuid.uuid4().hex[:6]
 
             state["pending_signals"][sig_id] = {
@@ -329,9 +404,8 @@ def run_scanner():
                 "atr": atr
             }
 
-            print(f"✅ SIGNAL: {symbol} {direction} @ {entry}")
+            print(f"🔥 SIGNAL: {symbol} {direction}")
 
-            # ===== SEND TELEGRAM SIGNAL =====
             send_signal(sig_id, symbol, direction, strike, entry, sl, tgt)
 
     except Exception as e:
@@ -340,14 +414,28 @@ def run_scanner():
 # ================= MAIN =================
 def main():
     print("BOT STARTED")
-    send("🚀 Warrior v14 LIVE")
+    send("🚀 Warrior LIVE")
 
     threading.Thread(target=bot_listener, daemon=True).start()
 
     while True:
         try:
+            # ===== CAPITAL PROTECTION =====
+            if state["daily_pnl"] <= state["max_loss"]:
+                state["paused"] = True
+                send("🛑 Max Loss Hit. Bot Paused.")
+                time.sleep(60)
+                continue
+
+            if state["daily_pnl"] >= state["target_lock"]:
+                state["paused"] = True
+                send("💰 Target Achieved. Trading Stopped.")
+                time.sleep(60)
+                continue
+
             if state["active_trade"]:
                 monitor_trade()
+
             elif not state["paused"]:
                 run_scanner()
 
