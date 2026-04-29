@@ -90,22 +90,51 @@ def detect_smc(df):
 # OI ANALYSIS
 # =========================
 
-def get_option_chain():
+def get_option_chain(symbol):
     try:
         r = requests.post(
             "https://api.dhan.co/v2/optionchain",
             headers=HEADERS,
-            json={"UnderlyingScrip": "13"}  # NIFTY
+            json={"UnderlyingScrip": SYMBOLS[symbol]["dhan_scrip"]},
+            timeout=10
         )
-        return r.json()["data"]
-    except:
-        return None
+
+        data = r.json()
+
+        # 🔍 PRINT WHAT YOU ARE ACTUALLY GETTING
+        print("RAW OPTION CHAIN:", data)
+
+        # ✅ Correct extraction
+        chain = data.get("data", {}).get("oc", [])
+
+        return chain
+
+    except Exception as e:
+        print("Option chain error:", e)
+        return []
 
 def analyze_oi(chain):
-    call_oi = sum([x["CE"]["openInterest"] for x in chain])
-    put_oi  = sum([x["PE"]["openInterest"] for x in chain])
+    if not isinstance(chain, list):
+        return "NEUTRAL"
 
-    pcr = put_oi / (call_oi + 1)
+    total_call_oi = 0
+    total_put_oi = 0
+
+    for x in chain:
+        try:
+            ce = x.get("CE", {})
+            pe = x.get("PE", {})
+
+            total_call_oi += ce.get("openInterest", 0)
+            total_put_oi  += pe.get("openInterest", 0)
+
+        except Exception:
+            continue
+
+    if total_call_oi == 0:
+        return "NEUTRAL"
+
+    pcr = total_put_oi / total_call_oi
 
     if pcr > 1.2:
         return "BULLISH"
@@ -121,15 +150,24 @@ def select_strike(chain, direction):
     target = 0.5 if direction == "CE" else -0.5
 
     best = None
-    diff = 999
+    min_diff = float("inf")
 
     for s in chain:
-        opt = s["CE"] if direction == "CE" else s["PE"]
-        d = abs(opt.get("delta", 0) - target)
+        try:
+            opt = s["CE"] if direction == "CE" else s["PE"]
+            delta = opt.get("delta")
 
-        if d < diff:
-            diff = d
-            best = s["strikePrice"]
+            if delta is None:
+                continue
+
+            diff = abs(delta - target)
+
+            if diff < min_diff:
+                min_diff = diff
+                best = s["strikePrice"]
+
+        except:
+            continue
 
     return best
 
@@ -168,9 +206,10 @@ Target: {tgt}
 
 def run_scanner():
 
-    chain = get_option_chain()
+    chain = get_option_chain(symbol)
     if not chain:
-        return
+    print("No chain data, skipping...")
+    continue
 
     oi_bias = analyze_oi(chain)
 
