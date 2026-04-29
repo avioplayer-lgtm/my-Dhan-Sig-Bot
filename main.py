@@ -252,50 +252,90 @@ def bot_listener():
 
 # ================= SCANNER =================
 def run_scanner():
-    for symbol in ["NIFTY", "BANKNIFTY"]:
+    try:
+        print("🔍 Scanner cycle running...")
 
-        df = get_data(symbol)
-        if df is None:
-            continue
+        for symbol in ["NIFTY", "BANKNIFTY"]:
 
-        smc = detect_smc(df)
-        if not smc:
-            continue
+            print(f"\nChecking {symbol}...")
 
-        chain = get_option_chain(symbol)
-        oi_bias = analyze_oi(chain)
+            # ===== GET PRICE DATA =====
+            df = get_data(symbol)
+            if df is None or len(df) < 20:
+                print(f"{symbol}: Not enough data")
+                continue
 
-        direction = None
+            # ===== SMC DETECTION =====
+            smc = detect_smc(df)
+            print(f"{symbol}: SMC = {smc}")
 
-        if smc == "BOS_UP" and oi_bias != "BEARISH":
-            direction = "CE"
-        elif smc == "BOS_DOWN" and oi_bias != "BULLISH":
-            direction = "PE"
+            if not smc:
+                continue
 
-        if not direction:
-            continue
+            # ===== OPTION CHAIN =====
+            chain = get_option_chain(symbol)
 
-        strike = select_strike(chain, direction)
+            if not chain:
+                print(f"{symbol}: No option chain data")
+                oi_bias = "NEUTRAL"
+            else:
+                oi_bias = analyze_oi(chain)
 
-        last = df.iloc[-1]
-        entry = last["Close"]
-        atr = last["atr"]
+            print(f"{symbol}: OI Bias = {oi_bias}")
 
-        sl = entry - atr if direction=="CE" else entry + atr
-        tgt = entry + 2*atr if direction=="CE" else entry - 2*atr
+            # ===== DIRECTION DECISION =====
+            direction = None
 
-        sig_id = uuid.uuid4().hex[:6]
+            # 🔥 Slightly aggressive logic (better signal frequency)
+            if smc == "BOS_UP":
+                direction = "CE"
 
-        state["pending_signals"][sig_id] = {
-            "symbol": symbol,
-            "direction": direction,
-            "entry": entry,
-            "sl": sl,
-            "tgt": tgt,
-            "atr": atr
-        }
+            elif smc == "BOS_DOWN":
+                direction = "PE"
 
-        send_signal(sig_id, symbol, direction, strike, entry, sl, tgt)
+            if not direction:
+                print(f"{symbol}: No direction")
+                continue
+
+            # ===== STRIKE SELECTION =====
+            strike = "ATM"
+
+            if chain:
+                strike = select_strike(chain, direction)
+
+            print(f"{symbol}: Direction = {direction}, Strike = {strike}")
+
+            # ===== ENTRY / SL / TARGET =====
+            last = df.iloc[-1]
+            entry = float(last["Close"])
+            atr   = float(last["atr"])
+
+            if atr == 0 or pd.isna(atr):
+                print(f"{symbol}: Invalid ATR")
+                continue
+
+            sl  = entry - atr if direction == "CE" else entry + atr
+            tgt = entry + (2 * atr) if direction == "CE" else entry - (2 * atr)
+
+            # ===== CREATE SIGNAL =====
+            sig_id = uuid.uuid4().hex[:6]
+
+            state["pending_signals"][sig_id] = {
+                "symbol": symbol,
+                "direction": direction,
+                "entry": entry,
+                "sl": sl,
+                "tgt": tgt,
+                "atr": atr
+            }
+
+            print(f"✅ SIGNAL: {symbol} {direction} @ {entry}")
+
+            # ===== SEND TELEGRAM SIGNAL =====
+            send_signal(sig_id, symbol, direction, strike, entry, sl, tgt)
+
+    except Exception as e:
+        print("❌ SCANNER ERROR:", e)
 
 # ================= MAIN =================
 def main():
