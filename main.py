@@ -1,12 +1,18 @@
 # =========================
-# WARRIOR v15 EXECUTION READY
+# WARRIOR v16 DEBUG BUILD
 # =========================
 
-import os, time, uuid, threading, requests, pandas as pd, pytz
+import os, time, uuid, threading, requests, pandas as pd, pytz, logging
 from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# ================= LOGGING =================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+log = logging.getLogger("WARRIOR")
+
+print("=== BOT FILE STARTED ===")
 
 # ================= CONFIG =================
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
@@ -38,10 +44,6 @@ state = {
     "pending_signals": {},
     "last_update_id": 0,
     "paused": False,
-    "tsl_stage": 0,
-    "last_trade": None,
-    "reentry_count": 0,
-    "max_reentries": 1,
     "daily_pnl": 0,
     "max_loss": -1500,
     "target_lock": 3000
@@ -49,15 +51,21 @@ state = {
 
 # ================= TELEGRAM =================
 def send(msg):
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg}
-    )
+    try:
+        log.info(f"Sending Telegram: {msg[:50]}")
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg},
+            timeout=10
+        )
+    except Exception as e:
+        log.error(f"Telegram Error: {e}")
 
 def send_signal(sig_id, sym, dire, strike, entry, sl, t1, t2):
-    lot_cost = entry * LOT_SIZE[sym]
+    try:
+        lot_cost = entry * LOT_SIZE[sym]
 
-    msg = f"""
+        msg = f"""
 🚨 DHAN SIGNAL - {sym} {dire}
 ----------------------------
 
@@ -71,21 +79,25 @@ T1: ₹{round(t1,2)}
 T2: ₹{round(t2,2)}
 
 Lot Cost: ₹{round(lot_cost,0)}
-
-----------------------------
 """
 
-    kb = {
-        "inline_keyboard": [[
-            {"text": "Take Trade", "callback_data": f"take|{sig_id}"},
-            {"text": "Skip", "callback_data": f"skip|{sig_id}"}
-        ]]
-    }
+        kb = {
+            "inline_keyboard": [[
+                {"text": "Take Trade", "callback_data": f"take|{sig_id}"},
+                {"text": "Skip", "callback_data": f"skip|{sig_id}"}
+            ]]
+        }
 
-    requests.post(
-        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        json={"chat_id": CHAT_ID, "text": msg, "reply_markup": kb}
-    )
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "reply_markup": kb},
+            timeout=10
+        )
+
+        log.info(f"Signal Sent: {sym} {strike} {dire}")
+
+    except Exception as e:
+        log.error(f"Signal Error: {e}")
 
 # ================= DATA =================
 def get_data(symbol):
@@ -102,7 +114,8 @@ def get_data(symbol):
         r = requests.post(
             "https://api.dhan.co/v2/charts/intraday",
             headers=HEADERS,
-            json=payload
+            json=payload,
+            timeout=10
         ).json()
 
         df = pd.DataFrame({
@@ -112,6 +125,7 @@ def get_data(symbol):
         })
 
         if len(df) < 20:
+            log.warning(f"{symbol}: Not enough data")
             return None
 
         df["ema9"] = df["Close"].ewm(span=9).mean()
@@ -120,7 +134,8 @@ def get_data(symbol):
 
         return df.dropna()
 
-    except:
+    except Exception as e:
+        log.error(f"Data Error ({symbol}): {e}")
         return None
 
 # ================= OPTION CHAIN =================
@@ -133,43 +148,71 @@ def get_option_chain(symbol):
             timeout=10
         ).json()
 
-        return r.get("data", {}).get("oc", [])
-    except:
+        oc = r.get("data", {}).get("oc", [])
+
+        if not oc:
+            log.warning(f"{symbol}: Empty option chain")
+
+        return oc
+
+    except Exception as e:
+        log.error(f"Option Chain Error ({symbol}): {e}")
         return []
 
 def select_strike(chain, direction):
-    target = 0.5 if direction == "CE" else -0.5
-    best = None
-    diff = float("inf")
+    try:
+        target = 0.5 if direction == "CE" else -0.5
+        best = None
+        diff = float("inf")
 
-    for s in chain:
-        opt = s.get(direction, {})
-        delta = opt.get("delta")
+        for s in chain:
+            opt = s.get(direction, {})
+            delta = opt.get("delta")
 
-        if delta is None:
-            continue
+            if delta is None:
+                continue
 
-        d = abs(delta - target)
+            d = abs(delta - target)
 
-        if d < diff:
-            diff = d
-            best = s.get("strikePrice")
+            if d < diff:
+                diff = d
+                best = s.get("strikePrice")
 
-    return best
+        return best
+
+    except Exception as e:
+        log.error(f"Strike Error: {e}")
+        return None
 
 def get_option_price(chain, strike, direction):
-    for s in chain:
-        if s.get("strikePrice") == strike:
-            opt = s.get(direction, {})
-            return float(opt.get("lastPrice", 0))
-    return None
+    try:
+        for s in chain:
+            if s.get("strikePrice") == strike:
+                return float(s.get(direction, {}).get("lastPrice", 0))
+        return None
+    except Exception as e:
+        log.error(f"Price Error: {e}")
+        return None
 
-# ================= SIGNAL ENGINE =================
+# ================= TIME FILTER =================
+def is_valid_trading_time():
+    now = datetime.now(IST)
+    minutes = now.hour * 60 + now.minute
+
+    return (
+        (9*60+20 <= minutes <= 11*60+30) or
+        (13*60+30 <= minutes <= 15*60+15)
+    )
+
+# ================= SCANNER =================
 def run_scanner():
+    log.info("Running scanner...")
+
     if not is_valid_trading_time():
+        log.info("Outside trading window")
         return
 
-    for symbol in ["NIFTY", "BANKNIFTY"]:
+    for symbol in SYMBOLS.keys():
 
         df = get_data(symbol)
         if df is None:
@@ -180,7 +223,7 @@ def run_scanner():
 
         ema9, ema21, atr = last["ema9"], last["ema21"], last["atr"]
 
-        if atr == 0 or pd.isna(atr):
+        if pd.isna(atr) or atr == 0:
             continue
 
         trend_up = ema9 > ema21
@@ -204,6 +247,9 @@ def run_scanner():
             continue
 
         strike = select_strike(chain, direction)
+        if not strike:
+            continue
+
         option_price = get_option_price(chain, strike, direction)
 
         if not option_price or option_price < 10:
@@ -223,29 +269,21 @@ def run_scanner():
             "entry": entry,
             "sl": sl,
             "t1": t1,
-            "t2": t2,
-            "atr": atr
+            "t2": t2
         }
 
         send_signal(sig_id, symbol, direction, strike, entry, sl, t1, t2)
 
-# ================= TIME FILTER =================
-def is_valid_trading_time():
-    now = datetime.now(IST)
-    minutes = now.hour * 60 + now.minute
-
-    return (
-        (9*60+20 <= minutes <= 11*60+30) or
-        (13*60+30 <= minutes <= 15*60+15)
-    )
-
 # ================= TELEGRAM LISTENER =================
 def bot_listener():
+    log.info("Telegram listener started")
+
     while True:
         try:
             r = requests.get(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                params={"offset": state["last_update_id"]+1}
+                params={"offset": state["last_update_id"]+1},
+                timeout=20
             ).json()
 
             for up in r.get("result", []):
@@ -261,36 +299,41 @@ def bot_listener():
                     elif action == "skip":
                         state["pending_signals"].pop(sig_id, None)
 
-        except:
+        except Exception as e:
+            log.error(f"Telegram Listener Error: {e}")
             time.sleep(5)
 
 # ================= MAIN =================
 def main():
-    send("🚀 Warrior v15 LIVE")
+    log.info("🚀 Warrior v16 LIVE")
+
+    send("🚀 Warrior v16 LIVE")
 
     threading.Thread(target=bot_listener, daemon=True).start()
 
     while True:
         try:
+            log.info("Heartbeat: Bot alive")
+
             if state["daily_pnl"] <= state["max_loss"]:
                 state["paused"] = True
                 send("🛑 Max Loss Hit")
-                time.sleep(60)
+                time.sleep(30)
                 continue
 
             if state["daily_pnl"] >= state["target_lock"]:
                 state["paused"] = True
                 send("💰 Target Achieved")
-                time.sleep(60)
+                time.sleep(30)
                 continue
 
             if not state["paused"]:
                 run_scanner()
 
         except Exception as e:
-            print("ERROR:", e)
+            log.error(f"MAIN ERROR: {e}")
 
-        time.sleep(60)
+        time.sleep(15)
 
 if __name__ == "__main__":
     main()
