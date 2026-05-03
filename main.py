@@ -1,8 +1,8 @@
 # =========================
-# WARRIOR v14 STABLE BUILD
+# WARRIOR v15 EXECUTION READY
 # =========================
 
-import os, time, uuid, logging, threading, requests, pandas as pd, pytz
+import os, time, uuid, threading, requests, pandas as pd, pytz
 from datetime import datetime
 from dotenv import load_dotenv
 
@@ -28,14 +28,17 @@ SYMBOLS = {
     "BANKNIFTY": "25"
 }
 
+LOT_SIZE = {
+    "NIFTY": 65,
+    "BANKNIFTY": 15
+}
+
 state = {
     "active_trade": None,
     "pending_signals": {},
     "last_update_id": 0,
     "paused": False,
     "tsl_stage": 0,
-
-    # NEW
     "last_trade": None,
     "reentry_count": 0,
     "max_reentries": 1,
@@ -46,21 +49,30 @@ state = {
 
 # ================= TELEGRAM =================
 def send(msg):
-    try:
-        requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                      json={"chat_id": CHAT_ID, "text": msg})
-    except:
-        pass
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": msg}
+    )
 
-def send_signal(sig_id, sym, dire, strike, entry, sl, tgt):
+def send_signal(sig_id, sym, dire, strike, entry, sl, t1, t2):
+    lot_cost = entry * LOT_SIZE[sym]
+
     msg = f"""
-🚨 TRADE SIGNAL
+🚨 DHAN SIGNAL - {sym} {dire}
+----------------------------
 
-{sym} {strike} {dire}
+BUY: {sym} {strike} {dire}
 
-Entry: {round(entry,2)}
-SL: {round(sl,2)}
-Target: {round(tgt,2)}
+Entry: ₹{round(entry,2)}
+Stop Loss: ₹{round(sl,2)}
+
+Targets:
+T1: ₹{round(t1,2)}
+T2: ₹{round(t2,2)}
+
+Lot Cost: ₹{round(lot_cost,0)}
+
+----------------------------
 """
 
     kb = {
@@ -70,8 +82,10 @@ Target: {round(tgt,2)}
         ]]
     }
 
-    requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                  json={"chat_id": CHAT_ID, "text": msg, "reply_markup": kb})
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        json={"chat_id": CHAT_ID, "text": msg, "reply_markup": kb}
+    )
 
 # ================= DATA =================
 def get_data(symbol):
@@ -85,8 +99,11 @@ def get_data(symbol):
             "toDate": datetime.now().date().isoformat(),
         }
 
-        r = requests.post("https://api.dhan.co/v2/charts/intraday",
-                          headers=HEADERS, json=payload).json()
+        r = requests.post(
+            "https://api.dhan.co/v2/charts/intraday",
+            headers=HEADERS,
+            json=payload
+        ).json()
 
         df = pd.DataFrame({
             "Close": r.get("close", []),
@@ -103,18 +120,6 @@ def get_data(symbol):
 
         return df.dropna()
 
-    except Exception as e:
-        print("DATA ERROR:", e)
-        return None
-
-# ================= SMC =================
-def detect_smc(df):
-    try:
-        if df["High"].iloc[-1] > df["High"].iloc[-3]:
-            return "BOS_UP"
-        elif df["Low"].iloc[-1] < df["Low"].iloc[-3]:
-            return "BOS_DOWN"
-        return None
     except:
         return None
 
@@ -126,322 +131,164 @@ def get_option_chain(symbol):
             headers=HEADERS,
             json={"UnderlyingScrip": SYMBOLS[symbol]},
             timeout=10
-        )
+        ).json()
 
-        data = r.json()
-
-        if not isinstance(data, dict):
-            return []
-
-        oc = data.get("data", {}).get("oc", [])
-
-        if not isinstance(oc, list):
-            return []
-
-        return oc
-
-    except Exception as e:
-        print("OC ERROR:", e)
+        return r.get("data", {}).get("oc", [])
+    except:
         return []
 
-def analyze_oi(chain):
-    try:
-        call_oi = 0
-        put_oi = 0
-
-        for x in chain:
-            ce = x.get("CE", {})
-            pe = x.get("PE", {})
-
-            call_oi += ce.get("openInterest", 0)
-            put_oi += pe.get("openInterest", 0)
-
-        if call_oi == 0:
-            return "NEUTRAL"
-
-        pcr = put_oi / call_oi
-
-        if pcr > 1.2:
-            return "BULLISH"
-        elif pcr < 0.8:
-            return "BEARISH"
-        return "NEUTRAL"
-
-    except:
-        return "NEUTRAL"
-
 def select_strike(chain, direction):
-    try:
-        target = 0.5 if direction == "CE" else -0.5
-        best = None
-        diff = float("inf")
+    target = 0.5 if direction == "CE" else -0.5
+    best = None
+    diff = float("inf")
 
-        for s in chain:
-            opt = s.get("CE") if direction == "CE" else s.get("PE")
-            if not opt:
-                continue
+    for s in chain:
+        opt = s.get(direction, {})
+        delta = opt.get("delta")
 
-            delta = opt.get("delta")
-            if delta is None:
-                continue
+        if delta is None:
+            continue
 
-            d = abs(delta - target)
+        d = abs(delta - target)
 
-            if d < diff:
-                diff = d
-                best = s.get("strikePrice")
+        if d < diff:
+            diff = d
+            best = s.get("strikePrice")
 
-        return best if best else "ATM"
+    return best
 
-    except:
-        return "ATM"
+def get_option_price(chain, strike, direction):
+    for s in chain:
+        if s.get("strikePrice") == strike:
+            opt = s.get(direction, {})
+            return float(opt.get("lastPrice", 0))
+    return None
 
-# ================= TSL =================
-def monitor_trade():
-    t = state["active_trade"]
-    if not t:
+# ================= SIGNAL ENGINE =================
+def run_scanner():
+    if not is_valid_trading_time():
         return
 
-    try:
-        df = get_data(t["symbol"])
+    for symbol in ["NIFTY", "BANKNIFTY"]:
+
+        df = get_data(symbol)
         if df is None:
-            return
+            continue
 
-        price = df.iloc[-1]["Close"]
-        atr   = t["atr"]
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
 
-        move = price - t["entry"] if t["direction"] == "CE" else t["entry"] - price
+        ema9, ema21, atr = last["ema9"], last["ema21"], last["atr"]
 
-        # ===== MOVE SL TO COST =====
-        if state["tsl_stage"] == 0 and move > atr * 0.3:
-            state["tsl_stage"] = 1
-            t["sl"] = t["entry"]
-            send("🟢 SL moved to cost")
+        if atr == 0 or pd.isna(atr):
+            continue
 
-        # ===== TARGET HIT =====
-        if (price >= t["tgt"] and t["direction"]=="CE") or (price <= t["tgt"] and t["direction"]=="PE"):
-            send("🎯 Target Hit")
+        trend_up = ema9 > ema21
+        trend_down = ema9 < ema21
 
-            state["active_trade"] = None
-            state["tsl_stage"] = 0
+        pullback_up = prev["Close"] < prev["ema9"] and last["Close"] > ema9
+        pullback_dn = prev["Close"] > prev["ema9"] and last["Close"] < ema9
 
-            # RESET RE-ENTRY
-            state["last_trade"] = None
-            state["reentry_count"] = 0
-            return
+        direction = None
 
-        # ===== SL HIT =====
-        if (price <= t["sl"] and t["direction"]=="CE") or (price >= t["sl"] and t["direction"]=="PE"):
-            send("❌ SL Hit")
+        if trend_up and pullback_up:
+            direction = "CE"
+        elif trend_down and pullback_dn:
+            direction = "PE"
 
-            # STORE FOR RE-ENTRY
-            state["last_trade"] = t.copy()
-            state["reentry_count"] += 1
+        if not direction:
+            continue
 
-            state["active_trade"] = None
-            state["tsl_stage"] = 0
-            return
+        chain = get_option_chain(symbol)
+        if not chain:
+            continue
 
-    except Exception as e:
-        print("TSL ERROR:", e)
+        strike = select_strike(chain, direction)
+        option_price = get_option_price(chain, strike, direction)
+
+        if not option_price or option_price < 10:
+            continue
+
+        entry = option_price
+        sl = entry * 0.35
+        t1 = entry * 1.65
+        t2 = entry * 2.3
+
+        sig_id = uuid.uuid4().hex[:6]
+
+        state["pending_signals"][sig_id] = {
+            "symbol": symbol,
+            "direction": direction,
+            "strike": strike,
+            "entry": entry,
+            "sl": sl,
+            "t1": t1,
+            "t2": t2,
+            "atr": atr
+        }
+
+        send_signal(sig_id, symbol, direction, strike, entry, sl, t1, t2)
+
+# ================= TIME FILTER =================
+def is_valid_trading_time():
+    now = datetime.now(IST)
+    minutes = now.hour * 60 + now.minute
+
+    return (
+        (9*60+20 <= minutes <= 11*60+30) or
+        (13*60+30 <= minutes <= 15*60+15)
+    )
 
 # ================= TELEGRAM LISTENER =================
 def bot_listener():
     while True:
         try:
-            r = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
-                             params={"offset": state["last_update_id"]+1}).json()
+            r = requests.get(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates",
+                params={"offset": state["last_update_id"]+1}
+            ).json()
 
             for up in r.get("result", []):
                 state["last_update_id"] = up["update_id"]
 
                 if "callback_query" in up:
-                    data = up["callback_query"]["data"].split("|")
-                    action, sig_id = data
+                    action, sig_id = up["callback_query"]["data"].split("|")
 
                     if action == "take":
                         state["active_trade"] = state["pending_signals"].pop(sig_id, None)
-                        send("Trade Activated")
+                        send("✅ Trade Activated")
 
                     elif action == "skip":
                         state["pending_signals"].pop(sig_id, None)
 
         except:
             time.sleep(5)
-            
-# ================= Time based trading filter =================
-
-def is_valid_trading_time():
-    now = datetime.now(IST)
-
-    minutes = now.hour * 60 + now.minute
-
-    # Opening window
-    if (9 * 60 + 20) <= minutes <= (11 * 60 + 15):
-        return True
-
-    # Afternoon window
-    if (13 * 60 + 30) <= minutes <= (15 * 60 + 15):
-        return True
-
-    return False
-
-# ================= SCANNER =================
-def run_scanner():
-    try:
-        # ✅ TIME FILTER (CORRECT INDENTATION)
-        if not is_valid_trading_time():
-            print("⏰ Outside trading window. Skipping...")
-            return
-
-        print("🔍 Optimized Scanner Running...")
-
-        for symbol in ["NIFTY", "BANKNIFTY"]:
-
-            df = get_data(symbol)
-            if df is None or len(df) < 30:
-                continue
-
-            last = df.iloc[-1]
-            prev = df.iloc[-2]
-
-            ema9  = last["ema9"]
-            ema21 = last["ema21"]
-            atr   = last["atr"]
-
-            if atr == 0 or pd.isna(atr):
-                continue
-
-            # ===== TREND =====
-            trend_up   = ema9 > ema21
-            trend_down = ema9 < ema21
-            ema_gap    = abs(ema9 - ema21)
-            strong_trend = ema_gap > atr * 0.2
-
-            # ===== PULLBACK =====
-            pullback_up = prev["Close"] < prev["ema9"] and last["Close"] > ema9
-            pullback_dn = prev["Close"] > prev["ema9"] and last["Close"] < ema9
-
-            # ===== VOLATILITY =====
-            atr_avg = df["atr"].rolling(20).mean().iloc[-1]
-            high_vol = atr > atr_avg * 1.1
-
-            # ===== STRUCTURE =====
-            smc = detect_smc(df)
-
-            # ===== OPTION CHAIN =====
-            chain = get_option_chain(symbol)
-            oi_bias = analyze_oi(chain) if chain else "NEUTRAL"
-
-            # ===== SCORING =====
-            score_up = 0
-            score_dn = 0
-
-            if trend_up: score_up += 1
-            if strong_trend: score_up += 1
-            if pullback_up: score_up += 2
-            if smc == "BOS_UP": score_up += 2
-            if high_vol: score_up += 1
-            if oi_bias == "BULLISH": score_up += 1
-
-            if trend_down: score_dn += 1
-            if strong_trend: score_dn += 1
-            if pullback_dn: score_dn += 2
-            if smc == "BOS_DOWN": score_dn += 2
-            if high_vol: score_dn += 1
-            if oi_bias == "BEARISH": score_dn += 1
-
-            direction = None
-            if score_up >= 5:
-                direction = "CE"
-            elif score_dn >= 5:
-                direction = "PE"
-
-            if not direction:
-                continue
-
-            entry = float(last["Close"])
-            sl  = entry - atr if direction == "CE" else entry + atr
-            tgt = entry + (2 * atr) if direction == "CE" else entry - (2 * atr)
-
-            # ===== 🔁 RE-ENTRY =====
-            lt = state.get("last_trade")
-
-            if lt and state["reentry_count"] <= state["max_reentries"]:
-                if lt["symbol"] == symbol and lt["direction"] == direction:
-
-                    reentry_zone = abs(entry - lt["entry"]) < lt["atr"] * 0.5
-
-                    if reentry_zone:
-                        print("🔁 RE-ENTRY SIGNAL")
-
-                        sig_id = uuid.uuid4().hex[:6]
-
-                        state["pending_signals"][sig_id] = {
-                            "symbol": symbol,
-                            "direction": direction,
-                            "entry": entry,
-                            "sl": sl,
-                            "tgt": tgt,
-                            "atr": atr
-                        }
-
-                        send_signal(sig_id, symbol, direction, "RE-ENTRY", entry, sl, tgt)
-                        continue
-
-            # ===== NORMAL SIGNAL =====
-            strike = "ATM"
-            if chain:
-                strike = select_strike(chain, direction)
-
-            sig_id = uuid.uuid4().hex[:6]
-
-            state["pending_signals"][sig_id] = {
-                "symbol": symbol,
-                "direction": direction,
-                "entry": entry,
-                "sl": sl,
-                "tgt": tgt,
-                "atr": atr
-            }
-
-            print(f"🔥 SIGNAL: {symbol} {direction}")
-
-            send_signal(sig_id, symbol, direction, strike, entry, sl, tgt)
-
-    except Exception as e:
-        print("❌ SCANNER ERROR:", e)
 
 # ================= MAIN =================
 def main():
-    print("BOT STARTED")
-    send("🚀 Warrior LIVE")
+    send("🚀 Warrior v15 LIVE")
 
     threading.Thread(target=bot_listener, daemon=True).start()
 
     while True:
         try:
-            # ===== CAPITAL PROTECTION =====
             if state["daily_pnl"] <= state["max_loss"]:
                 state["paused"] = True
-                send("🛑 Max Loss Hit. Bot Paused.")
+                send("🛑 Max Loss Hit")
                 time.sleep(60)
                 continue
 
             if state["daily_pnl"] >= state["target_lock"]:
                 state["paused"] = True
-                send("💰 Target Achieved. Trading Stopped.")
+                send("💰 Target Achieved")
                 time.sleep(60)
                 continue
 
-            if state["active_trade"]:
-                monitor_trade()
-
-            elif not state["paused"]:
+            if not state["paused"]:
                 run_scanner()
 
         except Exception as e:
-            print("MAIN ERROR:", e)
+            print("ERROR:", e)
 
         time.sleep(60)
 
